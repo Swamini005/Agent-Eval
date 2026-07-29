@@ -1,0 +1,193 @@
+name: AI Agent Evaluation Pipeline CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Nightly cron at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # Manual execution trigger
+    inputs:
+      run_type:
+        description: 'Scope of benchmark execution'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - full
+
+jobs:
+  evaluate-agent:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+        benchmark-type: ["harbor", "contextbench"]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry Virtualenv
+        uses: actions/cache@v4
+        id: cache-venv
+        with:
+          path: .venv
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install Project Dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Build Docker Image
+        run: docker build -t travel-agent-api .
+
+      - name: Start Harbor Sandbox API Service
+        run: |
+          docker run -d -p 8000:8000 --name harbor-sandbox -e LLM_PROVIDER=mock travel-agent-api
+          # Wait for FastAPI service health endpoint
+          echo "Waiting for sandbox service to start..."
+          timeout 30s sh -c 'until curl --silent --fail http://localhost:8000/api/health; do sleep 2; done'
+          echo "Sandbox service successfully started."
+
+      - name: Create Mock Baseline Summary files
+        run: |
+          # Generate mock baseline statistics for branch comparison demo
+          echo '{"summary_metrics": {"accuracy": 0.85, "tool_accuracy": 0.90, "performance": 0.85, "quality": 0.85, "memory_and_retrieval": 0.80, "fault_metrics": 1.0}}' > baseline_summary.json
+          echo '{"agent_performance": {"average_latency_seconds": 1.5, "average_cost_usd": 0.001, "total_runs": 2}}' > baseline_agent.json
+
+      - name: Run Smoke Test / Benchmark Execution
+        if: ${{ github.event.inputs.run_type == 'smoke' || github.event_name == 'push' || github.event_name == 'pull_request' }}
+        run: |
+          # Query the FastAPI benchmark run endpoint using curl
+          # Exclude heavy faults to verify happy path metrics
+          curl -X POST "http://localhost:8000/api/benchmark/run" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tasks": [
+                {
+                  "id": "t1",
+                  "benchmark": "${{ matrix.benchmark-type }}",
+                  "category": "flight",
+                  "domain": "travel",
+                  "difficulty": "easy",
+                  "prompt": "Find a flight from JFK to LHR on 2026-09-01",
+                  "expected_answer": "SkyFlow TX-101",
+                  "expected_tools": ["search_flights"]
+                }
+              ],
+              "faults": [],
+              "concurrency": 2,
+              "max_retries": 1
+            }' > api_output.json
+          
+          # Extract generated summary metrics and write to summary files for comparator
+          poetry run python -c "
+          import json
+          with open('api_output.json') as f:
+              data = json.load(f)
+          with open('evaluation_summary.json', 'w') as f:
+              json.dump({'summary_metrics': data['summary']['summary_metrics']}, f)
+          with open('agent_report.json', 'w') as f:
+              json.dump({'agent_performance': data['summary']['execution_summary']}, f)
+          "
+
+      - name: Run Full Nightly Benchmark & Fault Injection
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.run_type == 'full' }}
+        run: |
+          # Run complete benchmark tasks along with deliberate fault injections
+          curl -X POST "http://localhost:8000/api/benchmark/run" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tasks": [
+                {
+                  "id": "t1",
+                  "benchmark": "${{ matrix.benchmark-type }}",
+                  "category": "flight",
+                  "domain": "travel",
+                  "difficulty": "easy",
+                  "prompt": "Find a flight from JFK to LHR on 2026-09-01",
+                  "expected_answer": "SkyFlow TX-101",
+                  "expected_tools": ["search_flights"]
+                }
+              ],
+              "faults": [
+                {
+                  "id": "F-01",
+                  "type": "planner_bypass",
+                  "component": "reasoning",
+                  "severity": "critical",
+                  "probability": 1.0,
+                  "scheduling": {},
+                  "parameters": {}
+                }
+              ],
+              "concurrency": 4,
+              "max_retries": 1
+            }' > api_output.json
+
+          # Extract summary metrics
+          poetry run python -c "
+          import json
+          with open('api_output.json') as f:
+              data = json.load(f)
+          with open('evaluation_summary.json', 'w') as f:
+              json.dump({'summary_metrics': data['summary']['summary_metrics']}, f)
+          with open('agent_report.json', 'w') as f:
+              json.dump({'agent_performance': data['summary']['execution_summary']}, f)
+          "
+
+      - name: Run Unit Tests
+        run: poetry run pytest
+
+      - name: Compare Against Main Branch Baseline
+        run: |
+          poetry run python app/evaluation/comparator.py \
+            --baseline-summary baseline_summary.json \
+            --candidate-summary evaluation_summary.json \
+            --baseline-agent baseline_agent.json \
+            --candidate-agent agent_report.json \
+            --thresholds thresholds.json \
+            --output-dir .
+
+      - name: Publish Markdown Summary
+        if: always()
+        run: |
+          if [ -f comparison.md ]; then
+            cat comparison.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Comparison report not found." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Post PR Sticky Comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: github.event_name == 'pull_request' && always()
+        with:
+          path: comparison.md
+
+      - name: Upload Run Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-reports-${{ matrix.benchmark-type }}
+          path: |
+            evaluation_summary.json
+            agent_report.json
+            comparison.json
+            comparison.md

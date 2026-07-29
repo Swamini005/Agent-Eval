@@ -1,0 +1,37 @@
+# Example Fault Configuration File
+# Intentionally introduce regressions into AI agents to verify evaluation robustness
+
+faults:
+  - id: F-REASONING-01
+    type: planner_bypass
+    component: reasoning
+    severity: critical
+    probability: 1.0
+    scheduling:
+      after_steps: 0
+    parameters: {}
+
+  - id: F-TOOL-01
+    type: tool_latency
+    component: tool
+    severity: warning
+    probability: 0.8
+    scheduling: {}
+    parameters:
+      delay_seconds: 1.5
+
+  - id: F-PROMPT-01
+    type: prompt_corruption
+    component: prompt
+    severity: info
+    probability: 0.5
+    scheduling: {}
+    parameters: {}
+
+  - id: F-MODEL-01
+    type: temperature_increase
+    component: model
+    severity: critical
+    probability: 1.0
+    scheduling: {}
+    parameters: {}

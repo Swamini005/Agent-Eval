@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "travel-assistant"
+version = "0.1.0"
+description = "Production-grade AI Travel Assistant using LangGraph and LangChain"
+authors = ["Antigravity <antigravity@google.com>"]
+readme = "README.md"
+packages = [{include = "app"}]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+langgraph = "^0.1.0"
+langchain = "^0.2.0"
+langchain-core = "^0.2.0"
+langchain-openai = "^0.1.0"
+langchain-google-genai = "^1.0.0"
+fastapi = "^0.111.0"
+uvicorn = "^0.30.0"
+pydantic = "^2.7.0"
+pydantic-settings = "^2.2.0"
+langfuse = "^2.0.0"
+streamlit = "^1.35.0"
+plotly = "^5.20.0"
+pandas = "^2.2.0"
+reportlab = "^4.1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
