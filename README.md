@@ -118,42 +118,6 @@ Reporter-->>User: Benchmark Results
 
 ---
 
-# Project Structure
-
-```text
-project/
-│
-├── agents/
-│   ├── travel_agent.py
-│   └── ...
-│
-├── benchmarks/
-│   ├── travel/
-│   │   ├── prompts.json
-│   │   ├── expected_outputs.json
-│   │   └── metadata.json
-│   └── ...
-│
-├── evaluator/
-│   ├── metrics.py
-│   ├── llm_judge.py
-│   ├── regression.py
-│   └── pipeline.py
-│
-├── runner/
-│   ├── run_benchmark.py
-│   ├── run_regression.py
-│   └── run_all.py
-│
-├── reports/
-│
-├── configs/
-│
-└── README.md
-```
-
----
-
 # Evaluation Pipeline
 
 The framework follows a simple evaluation flow:
@@ -192,21 +156,7 @@ No changes to the core evaluation pipeline are required.
 
 ---
 
-# Future Enhancements
 
-The framework is designed to grow with future evaluation needs. Planned enhancements include:
-
-- Multi-turn conversation evaluation
-- Tool-calling validation
-- RAG evaluation
-- Memory evaluation
-- Human review workflows
-- Parallel benchmark execution
-- CI/CD integration
-- Dashboard for historical benchmark tracking
-- Automated benchmark generation
-
----
 
 # Conclusion
 
