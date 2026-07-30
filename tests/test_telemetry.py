@@ -27,8 +27,11 @@ def test_telemetry_tracker_mock_behavior():
     assert handler is None
 
 def test_runner_integration_telemetry(tmp_path):
-    adapter = AgentFactory.create_agent("langgraph")
-    runner = BenchmarkRunner(adapter, concurrency=1, max_retries=1)
+    runner = BenchmarkRunner(
+        lambda task_id: AgentFactory.create_agent("langgraph"),
+        concurrency=1,
+        max_retries=1
+    )
     
     task = UnifiedBenchmarkTask(
         id="tel_t1",

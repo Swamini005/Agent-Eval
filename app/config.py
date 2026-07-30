@@ -1,6 +1,12 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
+# Every generated report goes here rather than the repository root, so a run
+# never litters the working tree and a single .gitignore entry covers all of it.
+# These files are outputs, not source: they are rebuilt by each run and must
+# never be committed.
+REPORTS_DIR = "reports"
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",

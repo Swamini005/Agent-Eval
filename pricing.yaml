@@ -1,0 +1,30 @@
+# Token pricing, USD per million tokens.
+#
+# Rates live here rather than inline in the runner so they can be updated when
+# providers change them, and so a report states which price list produced its
+# cost figures.
+#
+# Runs in mock mode spend nothing. Costing them at a real model's published rates
+# gives a *shadow cost*: what this suite would cost against that model. That is
+# the number worth tracking, because it changes when the agent starts using more
+# tokens even while local spend stays zero.
+
+default_model: gemini-1.5-flash
+
+models:
+  gemini-1.5-flash:
+    prompt_per_1m: 0.075
+    completion_per_1m: 0.30
+  gemini-1.5-pro:
+    prompt_per_1m: 1.25
+    completion_per_1m: 5.00
+  gpt-4o-mini:
+    prompt_per_1m: 0.15
+    completion_per_1m: 0.60
+  gpt-4o:
+    prompt_per_1m: 2.50
+    completion_per_1m: 10.00
+  # Explicit zero-rate entry for measuring token volume without shadow costing.
+  mock:
+    prompt_per_1m: 0.0
+    completion_per_1m: 0.0

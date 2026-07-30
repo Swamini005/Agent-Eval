@@ -88,3 +88,42 @@ def test_fault_injection_workflow(tmp_path):
         triggered_ids = [l["fault_id"] for l in logs]
         assert "F-01" in triggered_ids # prompt corruption
         assert "F-02" in triggered_ids # planner bypass
+
+
+def test_fork_isolates_state_and_is_deterministic():
+    """Forked engines share rules but never share counters, logs, or RNG state."""
+    configs = FaultConfigLoader.load_from_dict(FAULTS_RAW["faults"])
+    root = FaultInjectionEngine(configs, seed=42)
+
+    a, b = root.fork("task-a"), root.fork("task-b")
+    assert a is not b
+    assert a.current_task_id == "task-a" and b.current_task_id == "task-b"
+
+    a.increment_steps()
+    assert b.step_counter == 0, "step counters must not be shared between tasks"
+
+    # Same root seed + same task id must reproduce the same random stream.
+    again = FaultInjectionEngine(configs, seed=42).fork("task-a")
+    assert [a._random.random() for _ in range(5)] == [again._random.random() for _ in range(5)]
+
+    # The root aggregates every child's logs for reporting.
+    fault = a.trigger_fault("prompt_corruption", "prompt")
+    a.log_trigger(fault, "expected", "actual")
+    assert [entry.task_id for entry in root.collect_logs()] == ["task-a"]
+
+
+def test_retry_does_not_duplicate_fault_log_entries():
+    """A retried task reports the faults of the attempt that was kept, not every attempt.
+
+    Duplicate entries inflate injections_by_type, which is the denominator of the
+    regression catch rate.
+    """
+    configs = FaultConfigLoader.load_from_dict(FAULTS_RAW["faults"])
+    root = FaultInjectionEngine(configs, seed=0)
+    adapter = FaultInjectionMiddleware(AgentFactory.create_agent("langgraph"), root.fork("t1"))
+
+    for _ in range(3):
+        adapter.initialize({"session_id": "s", "task_id": "t1"})
+        adapter.engine.log_trigger(configs[0], "expected", "actual")
+
+    assert len(root.collect_logs()) == 1

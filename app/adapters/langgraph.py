@@ -1,17 +1,21 @@
 import time
 import uuid
 from typing import Dict, Any, List, Generator, Optional
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 from app.adapters.base import BaseAgentAdapter
 from app.adapters.registry import AdapterRegistry
 from app.agent.graph import travel_agent_graph
+from app.packs import PackRegistry
 
 @AdapterRegistry.register("langgraph")
 class LangGraphTravelAgentAdapter(BaseAgentAdapter):
     """
     Adapter implementing the BaseAgentAdapter interface for the LangGraph-based AI Travel Assistant.
     """
-    
+
+    # Domain whose pack declares which of this agent's tools perform retrieval.
+    DOMAIN = "travel"
+
     def __init__(self):
         self.graph = None
         self.config = {}
@@ -106,6 +110,29 @@ class LangGraphTravelAgentAdapter(BaseAgentAdapter):
         Collects details of all tool executions.
         """
         return self.last_state.get("tool_results", [])
+
+    def get_retrieval_documents(self) -> List[Dict[str, Any]]:
+        """
+        Surfaces documents fetched by this agent's knowledge-retrieval tools.
+
+        Which tools count as retrieval comes from the domain pack. Derived from
+        observed tool results, so a run that retrieved nothing reports nothing,
+        and a run served corrupted context reports the corrupted content it
+        actually received.
+        """
+        pack = PackRegistry.get(self.DOMAIN)
+        if pack is None:
+            return []
+
+        return [
+            {
+                "source": call.get("tool_name"),
+                "content": str(call.get("result", "")),
+                "args": call.get("args", {})
+            }
+            for call in self.get_tool_calls()
+            if call.get("tool_name") in pack.retrieval_tools
+        ]
 
     def get_execution_graph(self) -> Dict[str, Any]:
         """

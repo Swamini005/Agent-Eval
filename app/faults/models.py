@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
-from typing import Dict, Any, Optional, List
-from datetime import datetime
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 
 class FaultConfig(BaseModel):
     """
@@ -17,11 +17,18 @@ class FaultConfig(BaseModel):
 class FaultLogEntry(BaseModel):
     """
     Represents an occurrence of a triggered fault.
+
+    ``type`` mirrors FaultConfig.type and is the join key used by the evaluation
+    engine to compute regression catch rate per fault type, by the safety metric
+    to detect fault-triggered scenarios, and by the failure analyzer to classify
+    root causes. It is required: without it those consumers silently degrade to
+    their default branches rather than failing.
     """
     fault_id: str
+    type: str = Field(..., description="Fault behavior type, mirrors FaultConfig.type")
     severity: str
     component: str
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     expected_impact: str
     actual_impact: str
     status: str = "triggered"

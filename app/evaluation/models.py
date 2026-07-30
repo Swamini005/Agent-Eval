@@ -5,9 +5,19 @@ class EvaluationTaskInput(BaseModel):
     task_id: str
     benchmark: str
     category: str = "general"
+    domain: str = Field(
+        "",
+        description="Selects the domain pack supplying safety vocabulary for this "
+                    "task. Tasks from different domains may share a single run."
+    )
     prompt: str
     expected_answer: Optional[str] = None
     expected_tools: List[str] = Field(default_factory=list)
+    ground_truth: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Declarative, machine-checkable assertions for this task. "
+                    "See AssertionMetric for the supported clauses."
+    )
 
 class EvaluationExecutionInput(BaseModel):
     task_id: str
@@ -25,4 +35,12 @@ class EvaluationExecutionInput(BaseModel):
 class MetricResult(BaseModel):
     metric_name: str
     score: float = Field(..., description="Normalized score between 0.0 and 1.0")
+    measured: bool = Field(
+        True,
+        description="False when this metric had nothing to evaluate -- no domain "
+                    "pack, no assertions declared, no retrieval performed. "
+                    "Unmeasured results are excluded from aggregate scores rather "
+                    "than counted as either a pass or a failure, because both "
+                    "would misreport the agent."
+    )
     details: Dict[str, Any] = Field(default_factory=dict)

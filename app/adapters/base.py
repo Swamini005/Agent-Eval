@@ -64,3 +64,24 @@ class BaseAgentAdapter(ABC):
         Perform teardown actions (e.g. closing connections, cleaning memory).
         """
         pass
+
+    def get_injected_faults(self) -> List[Dict[str, Any]]:
+        """
+        Get the faults injected during this run, newest last.
+
+        A plain agent injects nothing; decorators such as FaultInjectionMiddleware
+        override this. Declaring it here keeps the runner from having to know
+        which concrete decorators are in the chain.
+        """
+        return []
+
+    def get_retrieval_documents(self) -> List[Dict[str, Any]]:
+        """
+        Get the documents this run actually retrieved, as {source, content}.
+
+        Returns empty for agents that perform no retrieval. Retrieval-quality
+        metrics must be able to distinguish "retrieved nothing" from "retrieved
+        something", so this reports observed execution only and never synthesises
+        placeholder documents.
+        """
+        return []

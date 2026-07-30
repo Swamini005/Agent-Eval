@@ -2,6 +2,11 @@ import os
 import json
 import sys
 import argparse
+import yaml
+
+# Console output stays ASCII. Emoji are fine inside the generated markdown,
+# which is written as UTF-8, but printing them crashes on any terminal using a
+# legacy codepage -- cp1252 on Windows raises UnicodeEncodeError.
 from typing import Dict, Any
 
 class BaselineComparator:
@@ -11,25 +16,37 @@ class BaselineComparator:
     Generates comparison.json and comparison.md, returning proper exit codes.
     """
     
-    def __init__(self, thresholds_path: str = "thresholds.json"):
-        self.thresholds = self._load_thresholds(thresholds_path)
+    # Single source of truth for every threshold in the project. The comparison
+    # limits live under a `comparison:` key alongside the gate's own thresholds,
+    # so there is one file to audit rather than one per consumer.
+    THRESHOLDS_FILE = os.path.join(os.path.dirname(__file__), "gate_thresholds.yaml")
 
+    def __init__(self, thresholds_path: str = None):
+        self.thresholds = self._load_thresholds(thresholds_path or self.THRESHOLDS_FILE)
+
+    # Every comparison reads a top-level key of evaluation_summary.summary_metrics,
+    # which the evaluation engine emits as {metric_name: float}. Reaching into a
+    # nested sub-score here silently yields a constant, producing a comparison
+    # that can never fail.
     def _load_thresholds(self, file_path: str) -> Dict[str, float]:
-        default = {
-            "max_accuracy_drop": 0.05,
-            "max_tool_accuracy_drop": 0.05,
-            "max_latency_increase_ratio": 0.20,
-            "max_cost_increase_ratio": 0.10,
-            "max_hallucination_increase": 0.05,
-            "max_regression_severity_increase": 0.10
-        }
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    return {**default, **json.load(f)}
-            except Exception as e:
-                print(f"Warning: Failed to load thresholds from {file_path}: {e}. Using defaults.")
-        return default
+        """
+        Read the `comparison:` section of the thresholds file.
+
+        Missing or malformed configuration raises rather than silently falling
+        back to built-in defaults. A comparison run that quietly used different
+        limits from the ones in the repository would produce a verdict nobody
+        could reproduce or audit.
+        """
+        with open(file_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+
+        thresholds = config.get("comparison")
+        if not thresholds:
+            raise ValueError(
+                f"{file_path} declares no `comparison:` section, so there are no "
+                f"limits to compare against."
+            )
+        return thresholds
 
     def compare(
         self,
@@ -84,18 +101,25 @@ class BaselineComparator:
                 "threshold": self.thresholds["max_cost_increase_ratio"],
                 "ratio_check": True
             },
-            "Hallucination": {
-                "base": base_metrics.get("quality", {}).get("hallucination_score", 0.0) if isinstance(base_metrics.get("quality"), dict) else 0.0,
-                "cand": cand_metrics.get("quality", {}).get("hallucination_score", 0.0) if isinstance(cand_metrics.get("quality"), dict) else 0.0,
-                "higher_better": False,
-                "threshold_key": "max_hallucination_increase",
-                "threshold": self.thresholds["max_hallucination_increase"]
-            },
-            "Reasoning": {
-                "base": base_metrics.get("quality", {}).get("reasoning_quality", 1.0) if isinstance(base_metrics.get("quality"), dict) else 1.0,
-                "cand": cand_metrics.get("quality", {}).get("reasoning_quality", 1.0) if isinstance(cand_metrics.get("quality"), dict) else 1.0,
+            "Quality": {
+                "base": base_metrics.get("quality", 1.0),
+                "cand": cand_metrics.get("quality", 1.0),
                 "higher_better": True,
-                "threshold_key": "max_accuracy_drop", # reuse drop limit
+                "threshold_key": "max_quality_drop",
+                "threshold": self.thresholds["max_quality_drop"]
+            },
+            "Safety": {
+                "base": base_metrics.get("safety_and_policy", 1.0),
+                "cand": cand_metrics.get("safety_and_policy", 1.0),
+                "higher_better": True,
+                "threshold_key": "max_safety_drop",
+                "threshold": self.thresholds["max_safety_drop"]
+            },
+            "Memory & Retrieval": {
+                "base": base_metrics.get("memory_and_retrieval", 1.0),
+                "cand": cand_metrics.get("memory_and_retrieval", 1.0),
+                "higher_better": True,
+                "threshold_key": "max_accuracy_drop",
                 "threshold": self.thresholds["max_accuracy_drop"]
             },
             "Fault Detection": {
@@ -104,13 +128,6 @@ class BaselineComparator:
                 "higher_better": True,
                 "threshold_key": "max_accuracy_drop",
                 "threshold": self.thresholds["max_accuracy_drop"]
-            },
-            "Regression Severity": {
-                "base": base_metrics.get("fault_metrics", {}).get("regression_severity", 0.0) if isinstance(base_metrics.get("fault_metrics"), dict) else 0.0,
-                "cand": cand_metrics.get("fault_metrics", {}).get("regression_severity", 0.0) if isinstance(cand_metrics.get("fault_metrics"), dict) else 0.0,
-                "higher_better": False,
-                "threshold_key": "max_regression_severity_increase",
-                "threshold": self.thresholds["max_regression_severity_increase"]
             }
         }
 
@@ -185,7 +202,7 @@ def main():
     parser.add_argument("--candidate-summary", default="evaluation_summary.json", help="Path to current evaluation_summary.json")
     parser.add_argument("--baseline-agent", default="baseline_agent.json", help="Path to baseline agent_report.json")
     parser.add_argument("--candidate-agent", default="agent_report.json", help="Path to current agent_report.json")
-    parser.add_argument("--thresholds", default="thresholds.json", help="Path to thresholds.json")
+    parser.add_argument("--thresholds", default=BaselineComparator.THRESHOLDS_FILE, help="Path to the thresholds YAML")
     parser.add_argument("--output-dir", default=".", help="Output directory path")
     args = parser.parse_args()
 
@@ -207,10 +224,10 @@ def main():
     passed = comparator.compare(b_sum, c_sum, b_agent, c_agent, output_dir=args.output_dir)
     
     if not passed:
-        print("❌ BUILD BLOCKED: Quality regression detected exceeding threshold tolerances!")
+        print("[FAIL] BUILD BLOCKED: Quality regression detected exceeding threshold tolerances!")
         sys.exit(1)
     else:
-        print("✅ BUILD SUCCESSFUL: Performance metrics are within tolerance parameters.")
+        print("[PASS] BUILD SUCCESSFUL: Performance metrics are within tolerance parameters.")
         sys.exit(0)
 
 if __name__ == "__main__":

@@ -1,8 +1,0 @@
-{
-  "max_accuracy_drop": 0.05,
-  "max_tool_accuracy_drop": 0.05,
-  "max_latency_increase_ratio": 0.20,
-  "max_cost_increase_ratio": 0.10,
-  "max_hallucination_increase": 0.05,
-  "max_regression_severity_increase": 0.10
-}

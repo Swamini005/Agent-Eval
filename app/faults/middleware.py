@@ -1,11 +1,18 @@
+import threading
 import time
-import random
+from importlib import import_module
 from typing import Dict, Any, List, Generator, Optional
 from unittest.mock import patch
 from app.adapters.base import BaseAgentAdapter
 from app.faults.engine import FaultInjectionEngine
 from app.faults.registry import FaultRegistry
-from app.faults.models import FaultConfig
+from app.packs import PackRegistry
+
+# Guards every window in which tool patches are installed. unittest.mock.patch
+# rebinds module attributes, which are process-global and not thread-safe, so
+# without this two concurrent tasks can restore each other's saved originals and
+# leave a MagicMock permanently in place.
+_TOOL_PATCH_LOCK = threading.RLock()
 
 class FaultInjectionMiddleware(BaseAgentAdapter):
     """
@@ -14,14 +21,33 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
     Uses dynamic patching to remain independent of any concrete agent framework.
     """
     
-    def __init__(self, target_adapter: BaseAgentAdapter, engine: FaultInjectionEngine):
+    def __init__(
+        self,
+        target_adapter: BaseAgentAdapter,
+        engine: FaultInjectionEngine,
+        domain: str = ""
+    ):
+        """
+        Args:
+            target_adapter: The agent being faulted.
+            engine: This task's private fault engine.
+            domain: Selects the domain pack that declares where tool-layer faults
+                attach. With no pack, tool faults are skipped rather than being
+                pointed at tools that may not exist.
+        """
         self.target = target_adapter
         self.engine = engine
+        self.domain = domain
 
     def initialize(self, config: Dict[str, Any]) -> None:
         """
         Intercepts initialization configuration parameters.
+
+        The runner calls this once per attempt, so it is also the point at which
+        per-attempt fault state is cleared. Without the reset a retried task
+        reports its faults once per attempt.
         """
+        self.engine.reset_run_state()
         self.engine.current_task_id = config.get("task_id")
         mutated_config = dict(config)
         
@@ -83,22 +109,23 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
             time.sleep(delay)
             self.engine.log_trigger(fault, f"Introduce {delay}s latency", f"Delayed task execution by {delay}s")
 
-        # Intercept tool executions during run
-        tool_patches = self._setup_tool_patches()
-        
-        # Activate all mock patches
-        for p in tool_patches:
-            p.start()
-            
-        try:
-            result = self.target.run(mutated_task, config)
-            
-            # Check for reasoning bypass / shortcut injection in returned state/plan
-            result = self._apply_reasoning_faults(result)
-            return result
-        finally:
+        # Tool faults replace module-level attributes, which every thread in the
+        # runner's pool shares. Serialise the patched window so concurrent tasks
+        # cannot interleave start/stop and leave a mock installed after the task
+        # that owned it has finished -- that corrupts unrelated tasks, and even
+        # later experiment arms in the same process.
+        with _TOOL_PATCH_LOCK:
+            tool_patches = self._setup_tool_patches()
             for p in tool_patches:
-                p.stop()
+                p.start()
+            try:
+                result = self.target.run(mutated_task, config)
+
+                # Check for reasoning bypass / shortcut injection in returned state/plan
+                return self._apply_reasoning_faults(result)
+            finally:
+                for p in reversed(tool_patches):
+                    p.stop()
 
     def stream(self, task: str) -> Generator[Dict[str, Any], None, None]:
         """
@@ -114,16 +141,16 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
             mutated_task = handler(mutated_task, fault)
             self.engine.log_trigger(fault, "Prompt corruption", "Mutated stream prompt")
             
-        tool_patches = self._setup_tool_patches()
-        for p in tool_patches:
-            p.start()
-            
-        try:
-            for chunk in self.target.stream(mutated_task):
-                yield chunk
-        finally:
+        with _TOOL_PATCH_LOCK:
+            tool_patches = self._setup_tool_patches()
             for p in tool_patches:
-                p.stop()
+                p.start()
+            try:
+                for chunk in self.target.stream(mutated_task):
+                    yield chunk
+            finally:
+                for p in reversed(tool_patches):
+                    p.stop()
 
     def get_trace(self) -> List[Dict[str, Any]]:
         trace = self.target.get_trace()
@@ -153,6 +180,18 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
 
     def cleanup(self) -> None:
         self.target.cleanup()
+
+    def get_injected_faults(self) -> List[Dict[str, Any]]:
+        """Faults this middleware injected, plus any injected further down the chain."""
+        return [log.model_dump() for log in self.engine.logs] + self.target.get_injected_faults()
+
+    def get_retrieval_documents(self) -> List[Dict[str, Any]]:
+        """
+        Delegates to the wrapped agent. Retrieval faults act on the tool layer, so
+        the documents reported here are the ones the agent genuinely received --
+        corrupted content included.
+        """
+        return self.target.get_retrieval_documents()
 
     # --- Internals ---
     
@@ -185,46 +224,53 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
 
     def _setup_tool_patches(self) -> List[Any]:
         """
-        Prepares standard mock service overrides (patching app.services.mocks methods)
-        to trigger simulated Tool execution failures.
+        Build the tool-layer patches for whichever faults fire this run.
+
+        Patch targets come from the domain pack rather than being hardcoded, so
+        the middleware carries no knowledge of any particular agent's tools. A
+        fault type with no target declared for this domain simply does not fire.
         """
+        pack = PackRegistry.get(self.domain)
+        if pack is None:
+            return []
+
         patches = []
-        
-        # 1. Tool Latency
-        fault = self.engine.trigger_fault("tool_latency", "tool")
-        if fault:
-            delay = fault.parameters.get("delay_seconds", 0.5)
-            def delay_decorator(orig_fn):
-                def wrapped(*args, **kwargs):
-                    time.sleep(delay)
-                    return orig_fn(*args, **kwargs)
-                return wrapped
-            
-            # Patch weather service as a demonstration
-            patches.append(patch("app.services.mocks.mock_weather_forecast", side_effect=delay_decorator(
-                lambda *args, **kwargs: {"city": "Paris", "date": "2026-08-01", "temperature_celsius": 18, "condition": "Overcast", "humidity_percentage": 60, "wind_speed_kph": 5}
-            )))
-            self.engine.log_trigger(fault, f"Inject tool latency of {delay}s", "Weather mock service patched with sleep delay")
+        for fault_type, target in pack.fault_targets.items():
+            fault = self.engine.trigger_fault(fault_type, "tool")
+            if not fault:
+                continue
 
-        # 2. Random Tool Failure
-        fault = self.engine.trigger_fault("random_tool_failure", "tool")
-        if fault:
-            patches.append(patch("app.services.mocks.mock_flight_search", side_effect=lambda *args, **kwargs: []))
-            self.engine.log_trigger(fault, "Force empty flight returns", "Flight mock service patched to return empty lists")
-            
-        # 3. Malformed Tool Output
-        fault = self.engine.trigger_fault("malformed_tool_output", "tool")
-        if fault:
-            patches.append(patch(
-                "app.services.mocks.mock_restaurant_search", 
-                side_effect=lambda *args, **kwargs: [{"name": "Error Response", "cuisine": "XML", "rating": 0.0, "average_price_usd": 0.0, "popular_dish": "<xml>error</xml>"}]
-            ))
-            self.engine.log_trigger(fault, "Force malformed XML dishes", "Restaurant mock service patched to return XML tags")
+            if target.returns is None:
+                # No replacement value declared: wrap the real function so the
+                # fault changes timing without changing output. Replacing the
+                # return value here would confound a latency fault with a
+                # correctness fault and make the resulting score unattributable.
+                delay = fault.parameters.get("delay_seconds", 0.5)
+                patches.append(patch(target.target, side_effect=self._delayed(target.target, delay)))
+                self.engine.log_trigger(
+                    fault,
+                    f"Delay {target.target} by {delay}s",
+                    f"Wrapped {target.target} with a {delay}s sleep, output unchanged"
+                )
+            else:
+                replacement = target.returns
+                patches.append(patch(target.target, side_effect=lambda *a, _v=replacement, **k: _v))
+                self.engine.log_trigger(
+                    fault,
+                    f"Replace {target.target} output",
+                    f"Patched {target.target} to return {replacement!r}"
+                )
 
-        # 4. Context Corruption
-        fault = self.engine.trigger_fault("context_corruption", "tool")
-        if fault:
-            patches.append(patch("app.services.mocks.mock_policy_document", side_effect=lambda *args, **kwargs: "[CORRUPTED POLICY CONTENT]"))
-            self.engine.log_trigger(fault, "Corrupt policy context", "Policy mock service patched to return corrupted placeholder")
-            
         return patches
+
+    @staticmethod
+    def _delayed(import_path: str, delay: float):
+        """Wrap the real function at `import_path` so it sleeps before returning."""
+        module_path, _, attr = import_path.rpartition(".")
+        original = getattr(import_module(module_path), attr)
+
+        def wrapped(*args, **kwargs):
+            time.sleep(delay)
+            return original(*args, **kwargs)
+
+        return wrapped

@@ -2,7 +2,7 @@ import pytest
 from app.evaluation.models import EvaluationTaskInput, EvaluationExecutionInput
 from app.evaluation.engine import EvaluationEngine
 
-def test_derived_kpi_calculations():
+def test_derived_kpi_calculations(tmp_path):
     engine = EvaluationEngine()
     
     # Define tasks: 2 tasks with faults, 1 adversarial task
@@ -41,7 +41,7 @@ def test_derived_kpi_calculations():
     # - t3 has overall_score 1.0 (refused successfully)
     
     # Let's run a check
-    reports = engine.evaluate_run(tasks, executions, fault_report)
+    reports = engine.evaluate_run(tasks, executions, fault_report, output_dir=str(tmp_path))
     
     summary = reports["summary"]
     assert "regression_catch_rate" in summary

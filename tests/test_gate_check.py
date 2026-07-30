@@ -13,7 +13,7 @@ def test_gate_check_baseline_success():
     
     # Run the gate check, it should pass (returncode 0)
     res_gate = subprocess.run(
-        [sys.executable, "app/evaluation/gate_check.py"],
+        [sys.executable, "-m", "app.evaluation.gate_check"],
         capture_output=True,
         text=True
     )

@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from typing import Optional, Any, Dict
 from datetime import datetime
 from io import BytesIO, StringIO
+from app.config import REPORTS_DIR
 
 # --- Page Config ---
 st.set_page_config(
@@ -36,6 +37,7 @@ st.markdown("""
 # --- Helper Functions to Load Workspace Reports ---
 @st.cache_data(ttl=5)  # Refresh cache every 5 seconds for auto-refresh
 def load_json_file(file_name: str) -> Optional[Any]:
+    file_name = os.path.join(REPORTS_DIR, file_name)
     if os.path.exists(file_name):
         try:
             with open(file_name, "r", encoding="utf-8") as f:
@@ -43,6 +45,20 @@ def load_json_file(file_name: str) -> Optional[Any]:
         except Exception as e:
             st.error(f"Error loading {file_name}: {e}")
     return None
+
+@st.cache_data(ttl=5)
+def load_run_history(file_name: str = None) -> list:
+    """Load the append-only run log written by EvaluationEngine, oldest first."""
+    file_name = file_name or os.path.join(REPORTS_DIR, "run_history.jsonl")
+    if not os.path.exists(file_name):
+        return []
+    records = []
+    with open(file_name, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
 
 def get_git_info() -> Dict[str, str]:
     """Capture git metadata or return mock/fallback values."""
@@ -55,11 +71,9 @@ def get_git_info() -> Dict[str, str]:
             "ci_status": "Success (All tests passed)"
         }
     except Exception:
-        return {
-            "branch": "main",
-            "commit": "a3f5b72c",
-            "ci_status": "Success (Mock CI: 21/21 passed)"
-        }
+        # Unknown, not invented: a fabricated commit hash on a dashboard makes a
+        # run untraceable while looking authoritative.
+        return {"branch": "unknown", "commit": "unknown", "ci_status": "unknown"}
 
 # --- PDF Exporter ---
 def generate_pdf_report(results_df: pd.DataFrame, summary_data: Dict[str, Any]) -> bytes:
@@ -149,30 +163,15 @@ def main():
     summary = load_json_file("evaluation_summary.json")
     git_info = get_git_info()
     
-    # Default fallbacks if pipeline hasn't been run or files are missing
-    if not results:
-        results = [
-            {"task_id": "harbor_1", "benchmark": "harbor", "prompt": "Mock Flight JFK to LAX", "overall_score": 0.85, "metrics": {"accuracy": 0.9, "tool_accuracy": 0.8, "performance": 0.85, "quality": 0.9, "memory_and_retrieval": 0.8, "fault_metrics": 1.0}},
-            {"task_id": "cb_2", "benchmark": "contextbench", "prompt": "Mock Weather in Paris", "overall_score": 0.75, "metrics": {"accuracy": 0.7, "tool_accuracy": 0.8, "performance": 0.75, "quality": 0.8, "memory_and_retrieval": 0.7, "fault_metrics": 0.8}}
-        ]
-    if not execution:
-        execution = {
-            "summary": {"total_tasks": 2, "successful_runs": 2},
-            "tasks": [
-                {"task_id": "harbor_1", "benchmark": "harbor", "prompt": "Mock Flight JFK to LAX", "response": "SkyFlow Flight 101", "tool_calls": [{"tool_name": "search_flights"}], "execution_graph": {"nodes": [{"name": "intent"}], "edges": []}, "latency_seconds": 1.5, "cost_usd": 0.001, "tokens": {"total_tokens": 150}, "errors": [], "memory_state": [], "retrieval_documents": [], "reasoning_nodes": [], "langfuse_trace_id": "trace_abc", "langfuse_deep_link": "https://cloud.langfuse.com/project/trace_abc"},
-                {"task_id": "cb_2", "benchmark": "contextbench", "prompt": "Mock Weather in Paris", "response": "Overcast and 20C", "tool_calls": [{"tool_name": "get_weather"}], "execution_graph": {"nodes": [{"name": "intent"}], "edges": []}, "latency_seconds": 2.2, "cost_usd": 0.002, "tokens": {"total_tokens": 200}, "errors": [], "memory_state": [], "retrieval_documents": [], "reasoning_nodes": [], "langfuse_trace_id": "trace_xyz", "langfuse_deep_link": "https://cloud.langfuse.com/project/trace_xyz"}
-            ]
-        }
-    if not fault_report:
-        fault_report = {
-            "summary": {"total_faults_injected": 2, "severity_distribution": {"warning": 1, "critical": 1}},
-            "injections": [
-                {"fault_id": "F-01", "severity": "warning", "component": "tool", "expected_impact": "Latency", "actual_impact": "Triggered"},
-                {"fault_id": "F-02", "severity": "critical", "component": "reasoning", "expected_impact": "Bypass", "actual_impact": "Triggered"}
-            ]
-        }
-    if not summary:
-        summary = {"global_average_score": 0.8, "total_tasks_evaluated": 2, "summary_metrics": {"accuracy": 0.8, "tool_accuracy": 0.8}}
+    # No fabricated fallbacks. If the pipeline has not been run there is nothing
+    # to show, and inventing plausible numbers would put fiction on screen that
+    # is indistinguishable from a real run.
+    if not results or not execution or not summary:
+        st.warning(
+            f"No evaluation reports found in `{REPORTS_DIR}/`. "
+            "Run `python demo_pipeline.py` to generate them."
+        )
+        st.stop()
 
     # Convert results array to DataFrame
     df_results = pd.DataFrame(results)
@@ -357,28 +356,38 @@ def main():
         st.title("📉 Regression Monitor")
         st.write("Watch quality drift across evaluation runs.")
         
-        # Generate dummy runs to demonstrate trends
-        runs = ["Run 1", "Run 2", "Run 3", "Run 4", "Run 5"]
-        accuracy_trends = [0.89, 0.88, 0.85, 0.81, 0.78]
-        latency_trends = [1.2, 1.3, 1.6, 2.4, 3.1]
-        cost_trends = [0.001, 0.0012, 0.0015, 0.002, 0.0028]
-        hallucination_trends = [0.05, 0.06, 0.12, 0.18, 0.22]
-        
+        history = load_run_history()
+        if len(history) < 2:
+            st.info(
+                f"Regression trends need at least two evaluation runs; "
+                f"{len(history)} recorded so far. Run `python demo_pipeline.py` "
+                f"again to append another run to run_history.jsonl."
+            )
+            st.stop()
+
         df_trend = pd.DataFrame({
-            "Run": runs,
-            "Accuracy": accuracy_trends,
-            "Latency (s)": latency_trends,
-            "Cost ($)": cost_trends,
-            "Hallucination": hallucination_trends
+            "Run": [f"Run {i + 1}" for i in range(len(history))],
+            "Timestamp": [r["timestamp"] for r in history],
+            "Overall Score": [r["global_average_score"] for r in history],
+            "Accuracy": [r["summary_metrics"].get("accuracy") for r in history],
+            "Quality": [r["summary_metrics"].get("quality") for r in history],
+            "Safety": [r["summary_metrics"].get("safety_and_policy") for r in history],
+            "Latency (s)": [r.get("average_latency_seconds") for r in history],
+            "Cost ($)": [r.get("average_cost_usd") for r in history],
+            "Avg Tokens": [r.get("average_total_tokens") for r in history]
         })
-        
-        tab_acc, tab_lat, tab_cost, tab_token = st.tabs(["Accuracy & Hallucination", "Latency Trend", "Cost Trend", "Token Inflation"])
-        
+
+        tab_acc, tab_lat, tab_cost, tab_token = st.tabs(["Quality Metrics", "Latency Trend", "Cost Trend", "Token Inflation"])
+
         with tab_acc:
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_trend["Run"], y=df_trend["Accuracy"], name="Accuracy Trend", line=dict(color='green', width=3)))
-            fig.add_trace(go.Scatter(x=df_trend["Run"], y=df_trend["Hallucination"], name="Hallucination Trend", line=dict(color='red', width=3, dash='dash')))
-            fig.update_layout(title="Accuracy vs Hallucination Drift", yaxis_range=[0.0, 1.0])
+            for name, color in (("Overall Score", "blue"), ("Accuracy", "green"),
+                                ("Quality", "orange"), ("Safety", "red")):
+                fig.add_trace(go.Scatter(
+                    x=df_trend["Run"], y=df_trend[name], name=name,
+                    line=dict(color=color, width=3)
+                ))
+            fig.update_layout(title="Metric Drift Across Runs", yaxis_range=[0.0, 1.0])
             st.plotly_chart(fig, use_container_width=True)
             
         with tab_lat:
@@ -390,8 +399,8 @@ def main():
             st.plotly_chart(fig_cost, use_container_width=True)
             
         with tab_token:
-            # Token trends
-            fig_tok = px.bar(df_trend, x="Run", y="Cost ($)", color="Cost ($)", title="Token Usage Multipliers")
+            fig_tok = px.bar(df_trend, x="Run", y="Avg Tokens", color="Avg Tokens",
+                             title="Average Total Tokens per Task")
             st.plotly_chart(fig_tok, use_container_width=True)
 
     elif page == "Fault Injection Monitor":
@@ -411,9 +420,33 @@ def main():
         else:
             st.info("No faults injected during this run.")
             
-        # 2. Regression detection rate
+        # 2. Regression detection rate, as measured by the evaluation engine.
         st.subheader("Regression Detection Rate")
-        st.metric(label="Regression Detection Rate", value="85.0%", delta="-5.0% (Planner bypasses occasionally bypass warnings)")
+        catch = (summary or {}).get("regression_catch_rate", {})
+        overall_catch = catch.get("overall")
+        injections_by_type = catch.get("injections_by_type", {})
+
+        if overall_catch is None:
+            st.warning(
+                "Not measured: no faults were injected in this run, so the suite has "
+                "produced no evidence that it can detect a regression."
+            )
+        else:
+            st.metric(
+                label="Overall Regression Detection Rate",
+                value=f"{overall_catch * 100:.1f}%",
+                help=f"Measured over {sum(injections_by_type.values())} injections."
+            )
+            by_type = catch.get("by_fault_type", {})
+            if by_type:
+                st.dataframe(pd.DataFrame([
+                    {
+                        "Fault Type": f_type,
+                        "Injections": injections_by_type.get(f_type, 0),
+                        "Detection Rate": f"{rate * 100:.1f}%"
+                    }
+                    for f_type, rate in sorted(by_type.items())
+                ]))
 
     elif page == "Langfuse Explorer":
         st.title("🔍 Langfuse Traces & Dashboard Links")

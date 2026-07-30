@@ -1,7 +1,5 @@
 import pytest
 from app.benchmarks.registry import BenchmarkRegistry
-from app.benchmarks.filters import BenchmarkFilters
-from app.benchmarks.dispatcher import BenchmarkDispatcher
 from app.benchmarks.models import UnifiedBenchmarkTask
 from app.adapters.factory import AgentFactory
 
@@ -88,50 +86,39 @@ def test_normalization_and_registry():
     assert normalized_custom[0].expected_answer == "The Golden Spoon"
     assert normalized_custom[0].expected_tools == ["search_restaurants"]
 
-def test_benchmark_filtering():
-    harbor_provider = BenchmarkRegistry.get_provider("harbor")
-    cb_provider = BenchmarkRegistry.get_provider("contextbench")
-    
-    tasks = harbor_provider.load_tasks(HARBOR_DATA) + cb_provider.load_tasks(CONTEXT_DATA)
-    assert len(tasks) == 2
-    
-    # Filter single harbor
-    harbor_only = BenchmarkFilters.filter_by_benchmarks(tasks, "harbor")
-    assert len(harbor_only) == 1
-    assert harbor_only[0].benchmark == "harbor"
-    
-    # Filter multiple benchmarks
-    both = BenchmarkFilters.filter_by_benchmarks(tasks, ["harbor", "contextbench"])
-    assert len(both) == 2
-    
-    # Shuffle and Sample
-    shuffled = BenchmarkFilters.shuffle(tasks, seed=42)
-    assert len(shuffled) == 2
-    
-    sampled = BenchmarkFilters.sample(tasks, 1)
-    assert len(sampled) == 1
 
-def test_benchmark_dispatcher():
-    # Resolve agent adapter
-    adapter = AgentFactory.create_agent("langgraph")
-    dispatcher = BenchmarkDispatcher(adapter)
-    
-    harbor_provider = BenchmarkRegistry.get_provider("harbor")
-    custom_provider = BenchmarkRegistry.get_provider("custom_json")
-    
-    tasks = harbor_provider.load_tasks(HARBOR_DATA) + custom_provider.load_tasks(CUSTOM_DATA)
-    
-    # Dispatch and run evaluations
-    report = dispatcher.dispatch(
-        tasks=tasks,
-        filter_benchmarks=["harbor"],
-        shuffle_tasks=False,
-        sample_n=1
-    )
-    
-    assert "summary" in report
-    assert report["summary"]["total_tasks_attempted"] == 1
-    assert report["summary"]["successful_executions"] == 1
-    assert len(report["results"]) == 1
-    assert report["results"][0]["benchmark"] == "harbor"
-    assert "tool_coverage" in report["results"][0]
+def test_foreign_benchmark_exports_load_through_a_provider(tmp_path, monkeypatch):
+    """A raw Harbor-format export can be dropped into tasks/ and evaluated.
+
+    This is what the provider registry is for: task files are normally already
+    in unified shape, but an external benchmark dump should not have to be
+    rewritten by hand before it can be run.
+    """
+    import json
+    from app.benchmarks import suites
+
+    monkeypatch.setattr(suites, "TASKS_DIR", str(tmp_path))
+    (tmp_path / "imported.json").write_text(json.dumps([
+        {
+            "task_id": "h-1",
+            "benchmark": "harbor",
+            "category": "flight_planning",
+            "domain": "travel",
+            "difficulty_level": "easy",
+            "task_prompt": "Find a flight from JFK to LHR",
+            "target_response": "TX-101",
+            "required_tools": ["search_flights"],
+        }
+    ]), encoding="utf-8")
+
+    suite = suites.load_suite("imported")
+
+    assert len(suite) == 1
+    assert suite.tasks[0].id == "h-1"
+    assert suite.tasks[0].prompt == "Find a flight from JFK to LHR"
+    assert suite.tasks[0].expected_tools == ["search_flights"]
+    assert suite.sha
+
+
+def test_registry_lists_its_providers():
+    assert set(BenchmarkRegistry.available()) >= {"harbor", "contextbench", "t3bench", "custom_json"}

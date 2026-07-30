@@ -1,4 +1,4 @@
-from typing import Dict, Type
+from typing import Dict, List, Type
 from app.benchmarks.base import BaseBenchmarkProvider
 
 class BenchmarkRegistry:
@@ -24,3 +24,8 @@ class BenchmarkRegistry:
                 f"Benchmark Provider '{name}' is not registered. Available providers: {list(cls._registry.keys())}"
             )
         return cls._registry[name_lower]()
+
+    @classmethod
+    def available(cls) -> List[str]:
+        """Names of every registered provider, for error messages and discovery."""
+        return sorted(cls._registry)

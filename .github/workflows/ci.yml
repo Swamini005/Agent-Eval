@@ -1,193 +1,152 @@
-name: AI Agent Evaluation Pipeline CI
+name: CI
+
+# Fast, hermetic gate for every change landing on main.
+# Runs the unit tests and the headless evaluation pipeline in mock mode,
+# then enforces app/evaluation/gate_thresholds.yaml.
+# The heavier multi-seed experiment lives in nightly-experiment.yml.
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  schedule:
-    # Nightly cron at midnight UTC
-    - cron: '0 0 * * *'
   workflow_dispatch:
-    # Manual execution trigger
-    inputs:
-      run_type:
-        description: 'Scope of benchmark execution'
-        required: true
-        default: 'smoke'
-        type: choice
-        options:
-          - smoke
-          - full
+
+permissions:
+  contents: read
+  # Reading artifacts from previous runs on main, to compare a PR against the
+  # last known-good baseline.
+  actions: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Forces app/agent/nodes.py:get_llm() to raise immediately so every node takes
+  # its deterministic rule-based fallback. Without this the default provider is
+  # "google" (app/config.py) and each node waits on a network call that will fail
+  # anyway -- which blows the p95_latency gate non-deterministically.
+  LLM_PROVIDER: mock
+  PYTHONUNBUFFERED: "1"
+  # DeepEval reports usage to a third party by default; an evaluation harness
+  # should not transmit anything about the runs it measures.
+  DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
+  ERROR_REPORTING: "NO"
 
 jobs:
-  evaluate-agent:
+  test-and-evaluate:
+    name: Tests + Evaluation Gate
     runs-on: ubuntu-latest
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12"]
-        benchmark-type: ["harbor", "contextbench"]
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Set up Poetry
-        uses: snok/install-poetry@v1
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest -v --junitxml=pytest-report.xml
+
+      - name: Run the suite through DeepEval
+        # Named requirement: the project must gate through promptfoo or DeepEval.
+        # Metrics stay deterministic, so this spends no judge tokens and needs
+        # no API key -- DeepEval supplies the runner and the exit code only.
+        run: deepeval test run tests/test_deepeval_suite.py
+
+      - name: Run headless evaluation pipeline
+        run: python demo_pipeline.py --mode=ci
+
+      - name: Run CI verification gate check
+        run: python -m app.evaluation.gate_check
+
+      # --- Baseline comparison -------------------------------------------
+      # A push to main publishes its reports as the baseline every later PR is
+      # measured against. Without this the comparison has nothing to compare to,
+      # which is why the previous workflow fabricated a baseline with `echo`.
+      - name: Publish baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
         with:
-          virtualenvs-create: true
-          virtualenvs-in-project: true
+          name: baseline-reports
+          retention-days: 90
+          path: |
+            reports/evaluation_summary.json
+            reports/agent_report.json
 
-      - name: Cache Poetry Virtualenv
-        uses: actions/cache@v4
-        id: cache-venv
-        with:
-          path: .venv
-          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
-
-      - name: Install Project Dependencies
-        run: poetry install --no-interaction --no-root
-
-      - name: Build Docker Image
-        run: docker build -t travel-agent-api .
-
-      - name: Start Harbor Sandbox API Service
+      - name: Fetch baseline from main (PRs only)
+        id: baseline
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          docker run -d -p 8000:8000 --name harbor-sandbox -e LLM_PROVIDER=mock travel-agent-api
-          # Wait for FastAPI service health endpoint
-          echo "Waiting for sandbox service to start..."
-          timeout 30s sh -c 'until curl --silent --fail http://localhost:8000/api/health; do sleep 2; done'
-          echo "Sandbox service successfully started."
-
-      - name: Create Mock Baseline Summary files
-        run: |
-          # Generate mock baseline statistics for branch comparison demo
-          echo '{"summary_metrics": {"accuracy": 0.85, "tool_accuracy": 0.90, "performance": 0.85, "quality": 0.85, "memory_and_retrieval": 0.80, "fault_metrics": 1.0}}' > baseline_summary.json
-          echo '{"agent_performance": {"average_latency_seconds": 1.5, "average_cost_usd": 0.001, "total_runs": 2}}' > baseline_agent.json
-
-      - name: Run Smoke Test / Benchmark Execution
-        if: ${{ github.event.inputs.run_type == 'smoke' || github.event_name == 'push' || github.event_name == 'pull_request' }}
-        run: |
-          # Query the FastAPI benchmark run endpoint using curl
-          # Exclude heavy faults to verify happy path metrics
-          curl -X POST "http://localhost:8000/api/benchmark/run" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "tasks": [
-                {
-                  "id": "t1",
-                  "benchmark": "${{ matrix.benchmark-type }}",
-                  "category": "flight",
-                  "domain": "travel",
-                  "difficulty": "easy",
-                  "prompt": "Find a flight from JFK to LHR on 2026-09-01",
-                  "expected_answer": "SkyFlow TX-101",
-                  "expected_tools": ["search_flights"]
-                }
-              ],
-              "faults": [],
-              "concurrency": 2,
-              "max_retries": 1
-            }' > api_output.json
-          
-          # Extract generated summary metrics and write to summary files for comparator
-          poetry run python -c "
-          import json
-          with open('api_output.json') as f:
-              data = json.load(f)
-          with open('evaluation_summary.json', 'w') as f:
-              json.dump({'summary_metrics': data['summary']['summary_metrics']}, f)
-          with open('agent_report.json', 'w') as f:
-              json.dump({'agent_performance': data['summary']['execution_summary']}, f)
-          "
-
-      - name: Run Full Nightly Benchmark & Fault Injection
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.run_type == 'full' }}
-        run: |
-          # Run complete benchmark tasks along with deliberate fault injections
-          curl -X POST "http://localhost:8000/api/benchmark/run" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "tasks": [
-                {
-                  "id": "t1",
-                  "benchmark": "${{ matrix.benchmark-type }}",
-                  "category": "flight",
-                  "domain": "travel",
-                  "difficulty": "easy",
-                  "prompt": "Find a flight from JFK to LHR on 2026-09-01",
-                  "expected_answer": "SkyFlow TX-101",
-                  "expected_tools": ["search_flights"]
-                }
-              ],
-              "faults": [
-                {
-                  "id": "F-01",
-                  "type": "planner_bypass",
-                  "component": "reasoning",
-                  "severity": "critical",
-                  "probability": 1.0,
-                  "scheduling": {},
-                  "parameters": {}
-                }
-              ],
-              "concurrency": 4,
-              "max_retries": 1
-            }' > api_output.json
-
-          # Extract summary metrics
-          poetry run python -c "
-          import json
-          with open('api_output.json') as f:
-              data = json.load(f)
-          with open('evaluation_summary.json', 'w') as f:
-              json.dump({'summary_metrics': data['summary']['summary_metrics']}, f)
-          with open('agent_report.json', 'w') as f:
-              json.dump({'agent_performance': data['summary']['execution_summary']}, f)
-          "
-
-      - name: Run Unit Tests
-        run: poetry run pytest
-
-      - name: Compare Against Main Branch Baseline
-        run: |
-          poetry run python app/evaluation/comparator.py \
-            --baseline-summary baseline_summary.json \
-            --candidate-summary evaluation_summary.json \
-            --baseline-agent baseline_agent.json \
-            --candidate-agent agent_report.json \
-            --thresholds thresholds.json \
-            --output-dir .
-
-      - name: Publish Markdown Summary
-        if: always()
-        run: |
-          if [ -f comparison.md ]; then
-            cat comparison.md >> $GITHUB_STEP_SUMMARY
+          run_id=$(gh run list --workflow=ci.yml --branch=main --status=success                      --limit=1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$run_id" ]; then
+            echo "No successful run on main yet; nothing to compare against."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh run download "$run_id" --name baseline-reports --dir baseline 2>/dev/null; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Baseline downloaded from run $run_id."
           else
-            echo "Comparison report not found." >> $GITHUB_STEP_SUMMARY
+            # The first PR after this workflow lands has no baseline artifact.
+            # That is expected, and must not fail the build.
+            echo "Run $run_id published no baseline-reports artifact."
+            echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Post PR Sticky Comment
-        uses: marocchino/sticky-pull-request-comment@v2
-        if: github.event_name == 'pull_request' && always()
-        with:
-          path: comparison.md
+      - name: Compare against main
+        if: github.event_name == 'pull_request' && steps.baseline.outputs.found == 'true'
+        run: |
+          python -m app.evaluation.comparator             --baseline-summary baseline/evaluation_summary.json             --candidate-summary reports/evaluation_summary.json             --baseline-agent baseline/agent_report.json             --candidate-agent reports/agent_report.json             --output-dir reports
 
-      - name: Upload Run Artifacts
+      - name: Publish evaluation summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import os
+
+          print("## Agent Evaluation Summary\n")
+
+          if not os.path.exists("reports/evaluation_summary.json"):
+              print("_No evaluation summary was produced -- the pipeline failed before reporting._")
+              raise SystemExit(0)
+
+          with open("reports/evaluation_summary.json", encoding="utf-8") as fh:
+              summary = json.load(fh)
+
+          print(f"**Global average score:** {summary.get('global_average_score', 'n/a')}")
+          print(f"**Tasks evaluated:** {summary.get('total_tasks_evaluated', 'n/a')}\n")
+          print("| Metric | Score |")
+          print("| --- | --- |")
+          for name, score in summary.get("summary_metrics", {}).items():
+              print(f"| {name.replace('_', ' ').title()} | {score} |")
+
+          if os.path.exists("reports/comparison.md"):
+              print()
+              with open("reports/comparison.md", encoding="utf-8") as cmp_fh:
+                  print(cmp_fh.read())
+          PY
+
+      - name: Upload evaluation reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: evaluation-reports-${{ matrix.benchmark-type }}
+          name: evaluation-reports
+          if-no-files-found: warn
           path: |
-            evaluation_summary.json
-            agent_report.json
-            comparison.json
-            comparison.md
+            pytest-report.xml
+            reports/

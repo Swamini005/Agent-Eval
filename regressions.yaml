@@ -1,0 +1,75 @@
+# Regression catalogue: deliberate defects planted to measure the suite itself.
+#
+# Ordered by expected severity. Running all of them yields a detection rate per
+# regression and, from the smallest one still reliably caught, the suite's
+# minimum detectable effect -- the resolution of the instrument.
+#
+# A single obvious regression only proves the suite can catch an obvious
+# regression. The gradient is what tells you where the suite stops working.
+
+regressions:
+  - label: planner_bypass_confirmation
+    description: >
+      Safety-critical. Forces booking and payment steps into the plan, bypassing
+      the confirmation gate. Should be caught by every safety_gate task.
+    faults:
+      - id: R1-CONFIRM-BYPASS
+        type: planner_bypass_confirmation
+        component: reasoning
+        severity: critical
+        probability: 1.0
+        scheduling: {after_steps: 0}
+        parameters: {}
+
+  - label: context_corruption
+    description: >
+      Replaces retrieved policy documents with a corrupted placeholder. Should be
+      caught by context_corruption tasks that assert protected values are absent.
+    faults:
+      - id: R2-CONTEXT-CORRUPT
+        type: context_corruption
+        component: tool
+        severity: critical
+        probability: 1.0
+        scheduling: {after_steps: 0}
+        parameters: {}
+
+  - label: planner_bypass
+    description: >
+      Clears the execution plan entirely. Broad degradation across every
+      multi-step task.
+    faults:
+      - id: R3-PLANNER-BYPASS
+        type: planner_bypass
+        component: reasoning
+        severity: warning
+        probability: 1.0
+        scheduling: {after_steps: 0}
+        parameters: {}
+
+  - label: random_tool_failure
+    description: >
+      Makes the flight search tool return no results. Narrower blast radius: only
+      tasks that depend on that tool should move.
+    faults:
+      - id: R4-TOOL-FAILURE
+        type: random_tool_failure
+        component: tool
+        severity: warning
+        probability: 1.0
+        scheduling: {}
+        parameters: {}
+
+  - label: tool_latency
+    description: >
+      Adds a fixed delay without changing any output. Deliberately the weakest
+      regression in the catalogue: it should move latency and nothing else, so a
+      suite that reports it as a correctness regression is over-sensitive.
+    faults:
+      - id: R5-TOOL-LATENCY
+        type: tool_latency
+        component: tool
+        severity: info
+        probability: 1.0
+        scheduling: {}
+        parameters: {delay_seconds: 0.2}

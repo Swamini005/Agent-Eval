@@ -1,9 +1,8 @@
 from app.benchmarks.models import UnifiedBenchmarkTask
 from app.benchmarks.base import BaseBenchmarkProvider
 from app.benchmarks.registry import BenchmarkRegistry
-from app.benchmarks.filters import BenchmarkFilters
-from app.benchmarks.dispatcher import BenchmarkDispatcher
 from app.benchmarks.runner import BenchmarkRunner
+from app.benchmarks.suites import TaskSuite, load_suite
 
 # Import concrete providers to trigger decorator registration
 import app.benchmarks.providers.harbor
@@ -15,8 +14,8 @@ __all__ = [
     "UnifiedBenchmarkTask",
     "BaseBenchmarkProvider",
     "BenchmarkRegistry",
-    "BenchmarkFilters",
-    "BenchmarkDispatcher",
-    "BenchmarkRunner"
+    "BenchmarkRunner",
+    "TaskSuite",
+    "load_suite"
 ]
 

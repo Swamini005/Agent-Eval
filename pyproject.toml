@@ -1,31 +1,28 @@
-[tool.poetry]
-name = "travel-assistant"
+[project]
+name = "agent-eval"
 version = "0.1.0"
-description = "Production-grade AI Travel Assistant using LangGraph and LangChain"
-authors = ["Antigravity <antigravity@google.com>"]
+description = "Evaluation and regression-gating harness for AI agents, with fault injection to verify the suite itself"
 readme = "README.md"
-packages = [{include = "app"}]
+requires-python = ">=3.12"
+# Runtime dependencies are pinned in requirements.txt, which is what CI and the
+# local setup install. Duplicating them here would create two lists to keep in
+# step and no mechanism to catch them drifting apart.
+dynamic = ["dependencies"]
 
-[tool.poetry.dependencies]
-python = "^3.12"
-langgraph = "^0.1.0"
-langchain = "^0.2.0"
-langchain-core = "^0.2.0"
-langchain-openai = "^0.1.0"
-langchain-google-genai = "^1.0.0"
-fastapi = "^0.111.0"
-uvicorn = "^0.30.0"
-pydantic = "^2.7.0"
-pydantic-settings = "^2.2.0"
-langfuse = "^2.0.0"
-streamlit = "^1.35.0"
-plotly = "^5.20.0"
-pandas = "^2.2.0"
-reportlab = "^4.1.0"
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
 
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.0.0"
+[tool.setuptools]
+packages = ["app"]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+# The tests import `app.*`, `dashboard`, and shell out to demo_pipeline.py, all of
+# which live at the repo root. pytest only puts the test file's own directory on
+# sys.path, so without this the whole suite fails to collect unless the package
+# happens to be pip-installed.
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,12 +1,14 @@
 import json
 import time
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.benchmarks.models import UnifiedBenchmarkTask
 from app.adapters.base import BaseAgentAdapter
-from app.faults.middleware import FaultInjectionMiddleware
+from app.pricing import load_pricing
 from app.telemetry import telemetry_tracker
+
+AdapterFactory = Callable[[str], BaseAgentAdapter]
 
 class BenchmarkRunner:
     """
@@ -14,14 +16,24 @@ class BenchmarkRunner:
     Runs normalized benchmark tasks in parallel against an Agent Adapter
     with fault injection, retry logic, and complete telemetry capture.
     """
-    
+
     def __init__(
         self,
-        agent_adapter: BaseAgentAdapter,
+        adapter_factory: AdapterFactory,
         concurrency: int = 4,
         max_retries: int = 2
     ):
-        self.agent_adapter = agent_adapter
+        """
+        Args:
+            adapter_factory: Called once per task with the task id, returning an
+                adapter dedicated to that task. Adapters hold per-run mutable
+                state (trace, metrics, session), so sharing one instance across
+                the thread pool interleaves telemetry between tasks. The factory
+                is what guarantees isolation.
+            concurrency: Maximum tasks executed in parallel.
+            max_retries: Retries per task after the initial attempt.
+        """
+        self.adapter_factory = adapter_factory
         self.concurrency = concurrency
         self.max_retries = max_retries
 
@@ -31,7 +43,9 @@ class BenchmarkRunner:
         Writes all telemetry reports to execution.json.
         """
         results = []
-        
+
+        os.makedirs(output_dir, exist_ok=True)
+
         # Determine parallel workers
         workers = min(self.concurrency, len(tasks)) if tasks else 1
         
@@ -82,7 +96,11 @@ class BenchmarkRunner:
         errors = []
         start_time = 0.0
         duration = 0.0
-        
+
+        # One adapter per task. Retries reuse it because initialize() resets the
+        # adapter's per-run state, but no other task ever touches this instance.
+        agent_adapter = self.adapter_factory(task.id)
+
         # Create a Langfuse trace for this task execution
         trace_payload = telemetry_tracker.create_trace(
             task_id=task.id,
@@ -100,30 +118,31 @@ class BenchmarkRunner:
         while attempt <= self.max_retries:
             try:
                 # Re-initialize state before each retry
-                self.agent_adapter.initialize({"session_id": session_id, "task_id": task.id})
-                
+                agent_adapter.initialize({"session_id": session_id, "task_id": task.id})
+
                 # Fetch Langfuse callback handler if enabled
                 cb_handler = telemetry_tracker.get_callback_handler(trace_id)
                 run_config = {"callbacks": [cb_handler]} if cb_handler else None
-                
+
                 start_time = time.time()
-                
+
                 # Run execution passing callbacks
-                run_result = self.agent_adapter.run(task.prompt, config=run_config)
+                run_result = agent_adapter.run(task.prompt, config=run_config)
                 duration = time.time() - start_time
-                
+
                 # Fetch details from adapter
-                trace = self.agent_adapter.get_trace()
-                tool_calls = self.agent_adapter.get_tool_calls()
-                graph_schema = self.agent_adapter.get_execution_graph()
-                metrics = self.agent_adapter.get_metrics()
-                
+                trace = agent_adapter.get_trace()
+                tool_calls = agent_adapter.get_tool_calls()
+                graph_schema = agent_adapter.get_execution_graph()
+                metrics = agent_adapter.get_metrics()
+                retrieval_documents = agent_adapter.get_retrieval_documents()
+
                 # Token estimation if metrics are absent
                 prompt_tokens = metrics.get("prompt_tokens", len(task.prompt) // 4)
                 completion_tokens = metrics.get("completion_tokens", len(run_result.get("response", "")) // 4)
                 total_tokens = prompt_tokens + completion_tokens
-                cost = round(prompt_tokens * 0.000005 + completion_tokens * 0.000015, 6)
-                
+                cost = load_pricing().cost(prompt_tokens, completion_tokens)
+
                 # Capture reasoning nodes from plan & observations
                 reasoning_nodes = []
                 for idx, step in enumerate(run_result.get("plan", [])):
@@ -132,15 +151,7 @@ class BenchmarkRunner:
                         "description": step,
                         "status": "completed" if idx < metrics.get("tool_calls_count", 0) else "planned"
                     })
-                
-                # Retrieval documents mock placeholder
-                retrieval_documents = [
-                    {
-                        "source": f"doc_{i}",
-                        "content": f"Information relevant to {task.category}"
-                    } for i in range(2)
-                ]
-                
+
                 # Evaluate tool coverage
                 executed_tool_names = [t.get("tool_name") for t in tool_calls]
                 tool_coverage = 0.0
@@ -149,12 +160,9 @@ class BenchmarkRunner:
                     tool_coverage = len(matched_tools) / len(task.expected_tools)
                 else:
                     tool_coverage = 1.0
-                
-                # Detect injected faults from middleware
-                injected_faults = []
-                if isinstance(self.agent_adapter, FaultInjectionMiddleware):
-                    injected_faults = [log.model_dump() for log in self.agent_adapter.engine.logs]
-                
+
+                injected_faults = agent_adapter.get_injected_faults()
+
                 # Log evaluation and reasoning spans to Langfuse
                 telemetry_tracker.log_evaluation(
                     trace_id=trace_id,
@@ -201,7 +209,7 @@ class BenchmarkRunner:
                 attempt += 1
                 print(f"Execution failed for task {task.id} (attempt {attempt}/{self.max_retries + 1}): {str(e)}")
             finally:
-                self.agent_adapter.cleanup()
+                agent_adapter.cleanup()
                 
         # If all attempts fail
         return {

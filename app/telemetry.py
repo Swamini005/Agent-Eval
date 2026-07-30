@@ -1,7 +1,6 @@
 import os
 import uuid
 from typing import Dict, Any, Optional, List
-from app.config import settings
 
 try:
     from langfuse import Langfuse
@@ -18,7 +17,11 @@ class LangfuseTracker:
     """
     
     def __init__(self):
-        self.public_key = os.getenv("LANGFUSE_PUBLIC_KEY") or settings.metadata.get("LANGFUSE_PUBLIC_KEY") if hasattr(settings, "metadata") else None
+        # Precedence matters here: the original expression bound as
+        # `(getenv(...) or ...) if hasattr(...) else None`, and Settings has no
+        # `metadata` attribute, so public_key was always None and telemetry never
+        # enabled regardless of the environment.
+        self.public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
         self.secret_key = os.getenv("LANGFUSE_SECRET_KEY")
         self.host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
         self.project_id = os.getenv("LANGFUSE_PROJECT_ID", "default_proj")
@@ -135,7 +138,7 @@ class LangfuseTracker:
         """
         if self.enabled and self.client:
             try:
-                span = self.client.span(
+                self.client.span(
                     trace_id=trace_id,
                     name=span_name,
                     input=span_input,

@@ -1,0 +1,119 @@
+name: Nightly Regression Experiment
+
+# Measures the evaluation suite, not the agent.
+#
+# Runs a clean arm plus one arm per entry in regressions.yaml, each across
+# several seeds, then checks that the suite still detects the regressions it is
+# known to catch and that its resolution has not degraded. If the suite has gone
+# blind, every green build after that point is uninformative -- this is what
+# catches that.
+#
+# Nightly rather than per-PR: the experiment is (arms + 1) x seeds full suite
+# runs, far too slow to sit in front of a merge. The fast gate is in ci.yml.
+
+on:
+  schedule:
+    # Nightly at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'Seeds per arm (more seeds = smaller detectable effect)'
+        required: true
+        default: '5'
+        type: string
+      target:
+        description: 'Agent target to measure'
+        required: true
+        default: 'react'
+        type: choice
+        options:
+          - react
+          - langgraph
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-experiment-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LLM_PROVIDER: mock
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  experiment:
+    name: Regression Experiment
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run regression experiment
+        run: |
+          python run_experiment.py \
+            --suite=dev \
+            --seeds=${{ github.event.inputs.seeds || '5' }} \
+            --target=${{ github.event.inputs.target || 'react' }}
+
+      - name: Enforce the instrument gate
+        # Fails when the suite stops detecting a regression it is known to catch,
+        # or when its minimum detectable effect grows.
+        run: python -m app.evaluation.gate_check
+
+      - name: Publish experiment summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import os
+
+          print("## Regression Experiment\n")
+
+          if not os.path.exists("reports/regression_report.json"):
+              print("_The experiment did not produce a report._")
+              raise SystemExit(0)
+
+          with open("reports/regression_report.json", encoding="utf-8") as fh:
+              report = json.load(fh)
+
+          baseline = report["baseline"]
+          print(f"**Clean baseline:** {baseline['suite_pass_rate']:.3f} pass rate "
+                f"(stdev {baseline['suite_stdev']:.4f}, "
+                f"{len(baseline['flaky_tasks'])} flaky, {len(baseline['seeds'])} seeds)\n")
+
+          print("| Regression | Pass rate | Effect | Detected | Gate |")
+          print("| --- | --- | --- | --- | --- |")
+          for arm in report["arms"]:
+              verdict = "**FAIL**" if arm["gate_would_fail"] else "pass"
+              print(f"| {arm['arm']} | {arm['suite_pass_rate']:.3f} | "
+                    f"{arm['true_effect']:+.3f} | {arm['detection_rate'] * 100:.0f}% | {verdict} |")
+
+          mde = report["minimum_detectable_effect"]
+          print(f"\n**Detected:** {report['regressions_detected']}/{report['regressions_planted']}")
+          print(f"\n**Minimum detectable effect:** "
+                f"{f'{mde:.3f} pass-rate points' if mde is not None else 'not resolved'}")
+          PY
+
+      - name: Upload experiment artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-experiment
+          if-no-files-found: warn
+          path: reports/
