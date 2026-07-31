@@ -218,7 +218,7 @@ def main():
             suggested_fix = f.get("suggested_fix")
             
             # Print failure reasons relevant to the failing categories
-            print(f"\n  * Task ID: {task_id} | Category: {category} | Fault Type: {fault_type}")
+            print(f"\n  * Task ID: {task_id} | Category: {diagnosis} | Fault Type: {fault_type}")
             print(f"    Reason: {root_cause}")
             print(f"    Suggested Fix: {suggested_fix}")
             
