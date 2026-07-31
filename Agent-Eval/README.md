@@ -242,6 +242,21 @@ calls: they went from 0.6s to 32s and failed outright when the key was absent.
 On Windows, set `PYTHONIOENCODING=utf-8` before `deepeval test run` — its console
 output contains characters cp1252 cannot encode.
 
+**On a managed Windows machine**, Application Control may block `uuid_utils`'
+native wheel by file hash. `langchain_core` hard-imports it with no fallback, so
+a blocked wheel makes the whole project unimportable rather than merely failing a
+test. Downgrade that one wheel after installing:
+
+```bash
+pip install --no-deps uuid_utils==0.10.0
+```
+
+It is deliberately not pinned in `requirements.txt`: `langchain-core` and
+`langsmith` both require `uuid-utils>=0.12.0`, so pinning 0.10.0 there is
+unsatisfiable — pip either refuses to resolve or backtracks to an ancient
+`langchain-core` whose `Reviver` has no `allowed_objects`, which `langgraph` then
+crashes on at import with a `TypeError` naming neither package.
+
 Everything generated lands in `reports/` and is gitignored. No run dirties the
 working tree.
 

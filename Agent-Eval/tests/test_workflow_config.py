@@ -144,3 +144,41 @@ def test_a_failing_gate_is_published_before_the_build_goes_red():
 
     order = [s.get("name") for s in steps]
     assert order.index("Publish result to the dashboard history") <            order.index("Fail the build if the gate failed")
+
+
+def test_requirements_do_not_pin_uuid_utils():
+    """A local workaround must not be a dependency of the project.
+
+    uuid_utils==0.10.0 works around Application Control on some managed Windows
+    machines, but langchain-core and langsmith both require uuid-utils>=0.12.0.
+    Pinning it in requirements.txt is unsatisfiable, so pip backtracks to an
+    ancient langchain-core whose Reviver has no allowed_objects -- and langgraph
+    then fails at import with a TypeError that names neither package. CI went red
+    that way, four collection errors deep, pointing at nothing relevant.
+    """
+    import re
+    from pathlib import Path
+
+    text = Path("requirements.txt").read_text(encoding="utf-8")
+    requirements = [
+        line.strip() for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    assert not [r for r in requirements if re.match(r"uuid[-_]utils", r, re.I)], (
+        "uuid_utils must stay a documented post-install step, not a requirement"
+    )
+
+
+def test_the_langchain_stack_is_pinned_not_floored():
+    """These packages move together and mismatch fails at import, not at a call.
+
+    An unpinned resolve is a build that works on one machine and not the next --
+    which is precisely how a green local suite became four red collection errors
+    on a clean runner.
+    """
+    from pathlib import Path
+
+    text = Path("requirements.txt").read_text(encoding="utf-8")
+    for package in ("langgraph", "langchain-core", "langsmith", "langchain-google-genai"):
+        assert f"{package}==" in text, f"{package} must be pinned exactly"

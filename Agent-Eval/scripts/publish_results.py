@@ -75,9 +75,12 @@ def ci_context():
 def build_record(gate_passed):
     summary = read_json("evaluation_summary.json")
     if summary is None:
-        raise SystemExit(
-            f"No evaluation_summary.json in {REPORTS_DIR}/. Run the pipeline first."
-        )
+        # Publishing runs with if:always(), so it also runs when the pipeline
+        # never got far enough to write a report. Failing here adds a second red
+        # step that names the wrong cause and buries the real one. Nothing to
+        # publish is not an error in this script.
+        print(f"No evaluation_summary.json in {REPORTS_DIR}/; nothing to publish.")
+        raise SystemExit(0)
 
     agent = (read_json("agent_report.json", {}) or {}).get("agent_performance", {})
     execution = (read_json("execution.json", {}) or {}).get("summary", {})
