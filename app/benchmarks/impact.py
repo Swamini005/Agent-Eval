@@ -71,9 +71,14 @@ def changed_files(base_ref: str = "origin/main") -> List[str]:
 
     Returns [] when git cannot answer -- a shallow clone, a missing ref, no git
     at all. Callers treat that as "cannot determine impact" and run everything.
+
+    When pushing directly to main, ``origin/main...HEAD`` is empty because HEAD
+    *is* main. ``HEAD~1`` catches that case by comparing against the previous
+    commit, so triage still narrows the suite.
     """
     for args in (["diff", "--name-only", f"{base_ref}...HEAD"],
-                 ["diff", "--name-only", base_ref]):
+                 ["diff", "--name-only", base_ref],
+                 ["diff", "--name-only", "HEAD~1"]):
         try:
             out = subprocess.check_output(
                 ["git", *args], text=True, stderr=subprocess.DEVNULL, timeout=30
