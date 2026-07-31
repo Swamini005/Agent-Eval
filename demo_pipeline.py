@@ -115,6 +115,7 @@ def main():
     target = DEFAULT_TARGET
     use_triage = DEFAULT_TRIAGE
     use_advisor = True
+    concurrency = 2
     triaged_regressions = []
     for arg in sys.argv:
         if arg.startswith("--mode="):
@@ -133,6 +134,8 @@ def main():
             use_triage = False
         elif arg == "--no-advisor":
             use_advisor = False
+        elif arg.startswith("--concurrency="):
+            concurrency = int(arg.split("=")[1].strip())
         elif arg.startswith("--agent="):
             # Dotted path to a third-party agent, used with --target=external.
             # Read by ExternalAgentAdapter at construction.
@@ -253,9 +256,9 @@ def main():
     print(f"Target '{target}' wrapped in FaultInjectionMiddleware, one adapter per task.")
 
     # 4. RUN BENCHMARK TASKS (Parallel execution with captured telemetry)
-    print("\n--- 4. Executing Benchmark Runner (Concurrency = 2) ---")
+    print(f"\n--- 4. Executing Benchmark Runner (Concurrency = {concurrency}) ---")
     budget = RunBudget(max_tokens=max_tokens or None)
-    runner = BenchmarkRunner(build_adapter, concurrency=2, max_retries=1, budget=budget)
+    runner = BenchmarkRunner(build_adapter, concurrency=concurrency, max_retries=1, budget=budget)
 
     # We output to the local workspace
     runner.run_benchmark(tasks, output_dir=REPORTS_DIR)
