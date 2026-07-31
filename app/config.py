@@ -45,8 +45,28 @@ class Settings(BaseSettings):
 
     # A real model needs bounds. Without a timeout one hung request stalls the
     # whole run; without a retry cap a rate-limited key retries indefinitely.
-    LLM_TIMEOUT_SECONDS: float = 30.0
+    #
+    # 45s rather than 30s. The old value was shorter than a single reasoning
+    # call: with thinking enabled, measured median task latency was 332s against
+    # 30s of allowance, and eleven of thirty tasks failed as timeouts that read
+    # like agent errors. It stays tight because the suite targets a ~45s
+    # wall-clock run, and a timeout longer than the whole run cannot bound it --
+    # one hung call would blow the budget on its own.
+    #
+    # Raise this, not the run budget, if you re-enable a large thinking budget.
+    LLM_TIMEOUT_SECONDS: float = 45.0
     LLM_MAX_RETRIES: int = 2
+
+    # Gemini 2.5 models reason before answering unless told not to. The agent
+    # makes four or more sequential calls per task and the suite runs thirty
+    # tasks, so that reasoning is paid for ~150 times per target and dominates
+    # wall-clock time. The graph does its own planning in planner_node, so the
+    # model's internal deliberation is largely redundant here.
+    #
+    # 0 disables it. Set to -1 for a dynamic budget, or a positive token count to
+    # cap it. Ignored by providers other than Google, and by Gemini models that
+    # do not allow it to be disabled (2.5 Pro has a floor of 128).
+    LLM_THINKING_BUDGET: Optional[int] = 0
 
     # API keys
     GOOGLE_API_KEY: Optional[str] = None

@@ -84,13 +84,158 @@ def check_experiment(thresholds, report_file=None):
     return violations
 
 
+def nothing_to_gate() -> bool:
+    """
+    True when triage decided this change cannot move any task's result.
+
+    The pipeline exits before running the benchmark in that case, so there are no
+    reports to gate. That is a legitimate outcome for a documentation or CI-only
+    commit, and must not fail the build.
+
+    It must not read as a *pass* either -- a gate that says "passed" without
+    having measured anything is the failure mode this project exists to catch --
+    so the caller prints what was skipped and why, rather than a green tick.
+    """
+    triage_file = os.path.join(REPORTS_DIR, "triage.json")
+    if not os.path.exists(triage_file):
+        return False
+    try:
+        with open(triage_file, "r", encoding="utf-8") as f:
+            decision = json.load(f)
+    except (OSError, ValueError):
+        # An unreadable decision is not evidence that nothing was affected.
+        return False
+    return decision.get("scope") == "none" and not decision.get("task_ids")
+
+
+# The job summary has a 1 MB ceiling and is read in a browser. Thirty rows of
+# diagnostics buries the verdict it sits underneath.
+MAX_DIAGNOSTIC_ROWS = 12
+
+
+def _fmt(value, spec=".3f"):
+    """Format a measured value, distinguishing 'not measured' from zero."""
+    if value is None:
+        return "NOT MEASURED"
+    try:
+        return format(value, spec)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def write_step_summary(passed, checks, violations, summary, execution,
+                       failures_data, triage=None):
+    """
+    Publish the whole gate result to the GitHub job summary.
+
+    Everything the gate decided goes here, not just what failed: each threshold
+    with the value measured against it, the suite metrics, the run's facts, and
+    the diagnostics for failing tasks. A summary that lists only violations
+    cannot be used to tell a passing run from an unmeasured one -- the reader
+    sees no rows either way -- so passing checks are shown with the number that
+    passed them.
+
+    No-op outside GitHub Actions, where GITHUB_STEP_SUMMARY is unset.
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+
+    from app.config import settings
+
+    out = []
+    out.append("## Evaluation Gate: " + ("PASSED" if passed else "FAILED"))
+    out.append("")
+
+    run_summary = execution.get("summary", {})
+    tasks = execution.get("tasks", [])
+    tokens = sum((t.get("tokens") or {}).get("total_tokens", 0) for t in tasks)
+    cost = sum(t.get("cost_usd", 0.0) for t in tasks)
+    out.append(f"`{settings.LLM_PROVIDER}` / `{settings.MODEL_NAME or 'provider default'}` "
+               f"- {run_summary.get('total_tasks', len(tasks))} tasks, "
+               f"{run_summary.get('failed_runs', 0)} failed, "
+               f"{tokens:,} tokens, ${cost:.4f}")
+    if not run_summary.get("complete", True):
+        out.append("")
+        out.append(f"**Run was INCOMPLETE:** {run_summary.get('budget_stop_reason')} "
+                   f"-- these numbers do not describe the whole suite.")
+    out.append("")
+
+    if triage:
+        selected = len(triage.get("task_ids") or [])
+        out.append(f"**Triage:** {selected}/{triage.get('suite_size', '?')} tasks "
+                   f"(scope `{triage.get('scope', '?')}`) - {triage.get('rule_reason', '')}")
+        if triage.get("regressions"):
+            out.append(f"**Regressions injected:** {', '.join(triage['regressions'])}")
+        out.append("")
+
+    out.append("### Gate checks")
+    out.append("")
+    out.append("| Check | Measured | Threshold | Result |")
+    out.append("| --- | --- | --- | --- |")
+    for name, measured, threshold, ok in checks:
+        out.append(f"| {name} | {measured} | {threshold} | {'PASS' if ok else '**FAIL**'} |")
+    out.append("")
+
+    metrics = summary.get("summary_metrics") or {}
+    if metrics:
+        out.append("### Suite metrics")
+        out.append("")
+        out.append("| Metric | Score |")
+        out.append("| --- | --- |")
+        for name, score in metrics.items():
+            out.append(f"| {name.replace('_', ' ').title()} | {score} |")
+        out.append("")
+
+    if violations:
+        out.append("### Why the gate failed")
+        out.append("")
+        for v in violations:
+            out.append(f"- {v}")
+        out.append("")
+
+    # Called "diagnostics", not "failing tasks". FailureAnalyzer emits one entry
+    # per task whether or not that task failed -- a run with 29 of 30 successes
+    # still reports 30 -- so presenting them as failures would contradict the
+    # run summary printed above.
+    diagnostics = failures_data.get("failures", []) if failures_data else []
+    if diagnostics:
+        shown = diagnostics[:MAX_DIAGNOSTIC_ROWS]
+        out.append(f"### Diagnostics ({len(diagnostics)} tasks analysed)")
+        out.append("")
+        out.append("| Task | Diagnosis | Fault | Root cause | Suggested fix |")
+        out.append("| --- | --- | --- | --- | --- |")
+        for f in shown:
+            row = [f.get("task_id", ""), f.get("category", ""),
+                   f.get("fault_type", "N/A"), f.get("root_cause", ""),
+                   f.get("suggested_fix", "")]
+            out.append("| " + " | ".join(str(c).replace("|", "\\|") for c in row) + " |")
+        if len(diagnostics) > len(shown):
+            out.append("")
+            out.append(f"_{len(diagnostics) - len(shown)} further rows omitted._")
+        out.append("")
+
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+
 def main():
     summary_file = os.path.join(REPORTS_DIR, "evaluation_summary.json")
     execution_file = os.path.join(REPORTS_DIR, "execution.json")
     failure_file = os.path.join(REPORTS_DIR, "failure_report.json")
     thresholds_file = os.path.join(os.path.dirname(__file__), "gate_thresholds.yaml")
-    
+
     # 1. Read files
+    #
+    # Checked before the reports are looked for, not after. A skipped run leaves
+    # whatever the previous run wrote sitting in reports/, and gating those would
+    # report a pass built from a different commit's measurements.
+    if nothing_to_gate():
+        print("NOT MEASURED: triage selected no tasks -- this change cannot "
+              "affect any result, so the suite did not run.")
+        print("No gate was applied. This is not a pass.")
+        sys.exit(0)
+
     if not os.path.exists(summary_file) or not os.path.exists(execution_file) or not os.path.exists(thresholds_file):
         print(f"ERROR: Missing evaluation reports or thresholds configuration. Run demo_pipeline.py first.")
         sys.exit(1)
@@ -135,12 +280,17 @@ def main():
     # applicable ceiling depends on how the run was configured. Using the
     # deterministic number for a real run fails every build for a reason that has
     # nothing to do with the agent.
+    #
+    # Defaults to None, not a number. Both keys are currently absent from
+    # gate_thresholds.yaml, and a hardcoded fallback here would silently
+    # reinstate a gate the thresholds file deliberately removed -- with a value
+    # that appears nowhere a reader would look for it.
     from app.config import settings
 
     real_model = settings.LLM_PROVIDER.lower() != "mock"
     t_p95_latency = (
-        thresholds.get("p95_latency_real_model", 60.0) if real_model
-        else thresholds.get("p95_latency", 5.0)
+        thresholds.get("p95_latency_real_model") if real_model
+        else thresholds.get("p95_latency")
     )
     
     # 4. Perform gate checks
@@ -186,14 +336,82 @@ def main():
         )
 
 
-    if p95_latency > t_p95_latency:
+    # Latency is reported, not gated. See gate_thresholds.yaml for why, and for
+    # what to measure if it is reinstated. A threshold left in the file is still
+    # honoured, so re-adding the key is all it takes to turn the gate back on.
+    if t_p95_latency is not None and p95_latency > t_p95_latency:
         violations.append(
             f"p95 Latency: {p95_latency:.3f}s (Threshold: {t_p95_latency:.3f}s for "
             f"{settings.LLM_PROVIDER}, violated by {p95_latency - t_p95_latency:.3f}s)"
         )
-        
+
+
+    # 4a-ii. A configured provider that reported no usage was never called.
+    #
+    # Observed on 2026-07-31: two consecutive runs with LLM_PROVIDER=google took
+    # the agent's rule-based fallback for all thirty tasks -- 0 tool calls, 0.004s
+    # per task, token_source "estimated" -- and the gate passed them, because
+    # every threshold is a ratio and the rule-based path satisfies them. A run
+    # that never reached the model is not evidence about the model, and it must
+    # not be able to certify one.
+    #
+    # Checked on token_source rather than on latency or token count: it is the
+    # field that records where the numbers came from, and only the provider can
+    # set it to "provider".
+    if real_model:
+        exec_tasks = execution.get("tasks", [])
+        measured = [t for t in exec_tasks if t.get("token_source") == "provider"]
+        if exec_tasks and not measured:
+            violations.append(
+                f"NOT MEASURED: LLM_PROVIDER={settings.LLM_PROVIDER} is configured, but no "
+                f"task reported provider usage across {len(exec_tasks)} tasks -- the agent "
+                f"ran its rule-based fallback and the model was never called. "
+                f"This run is not evidence about the agent."
+            )
+
     # 4b. Statistical gate, when a multi-seed experiment has been run.
     violations.extend(check_experiment(thresholds.get("experiment", {})))
+
+    # 4c. Every check with the value measured against it, for the job summary.
+    # Built from the same variables the violations above were derived from, so
+    # the table and the verdict cannot disagree. Passing rows are included
+    # deliberately: a summary showing only failures looks identical whether the
+    # run passed or was never measured.
+    checks = [
+        ("Global average score", _fmt(global_score),
+         f">= {t_global_score:.3f}", global_score >= t_global_score),
+        ("Regression catch rate (overall)",
+         "NOT MEASURED" if overall_catch is None else f"{overall_catch * 100:.1f}%",
+         f">= {t_catch_overall * 100:.1f}%",
+         overall_catch is not None and overall_catch >= t_catch_overall),
+        ("Adversarial refusal rate",
+         "NOT MEASURED" if refusal_rate is None else f"{refusal_rate * 100:.1f}%",
+         f">= {t_refusal * 100:.1f}%",
+         refusal_rate is not None and refusal_rate >= t_refusal),
+        (f"p95 latency ({settings.LLM_PROVIDER})", f"{p95_latency:.3f}s",
+         "not gated" if t_p95_latency is None else f"<= {t_p95_latency:.3f}s",
+         t_p95_latency is None or p95_latency <= t_p95_latency),
+    ]
+    for fault_type, t_val in sorted(t_catch_by_type.items()):
+        measured = catch_by_type.get(fault_type)
+        checks.append((
+            f"Regression catch: {fault_type}",
+            "NOT MEASURED" if measured is None else f"{measured * 100:.1f}%",
+            f">= {t_val * 100:.1f}%",
+            measured is not None and measured >= t_val,
+        ))
+
+    triage_decision = None
+    triage_path = os.path.join(REPORTS_DIR, "triage.json")
+    if os.path.exists(triage_path):
+        try:
+            with open(triage_path, "r", encoding="utf-8") as f:
+                triage_decision = json.load(f)
+        except (OSError, ValueError):
+            triage_decision = None
+
+    write_step_summary(not violations, checks, violations, summary, execution,
+                       failures_data, triage_decision)
 
     # 5. Output results
     print("=" * 60)

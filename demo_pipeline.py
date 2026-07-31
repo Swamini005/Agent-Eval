@@ -67,14 +67,31 @@ DEFAULT_SEED = 0
 DEFAULT_SUITE = "dev"
 
 # Stop before the provider does. Groq's free tier is 100,000 tokens/day and this
-# agent spends ~10,000 on a task, so an unguarded 30-task run exhausts the quota
+# agent spends ~13,000 on a task, so an unguarded 30-task run exhausts the quota
 # partway through and the rest fail with 429s that read like agent failures.
 # 0 disables the ceiling.
-DEFAULT_MAX_TOKENS = 80_000
+#
+# Sized from a measured full run: 30 tasks x ~13,000 = ~390,000, so the previous
+# 400,000 left no headroom and killed the last four tasks -- which were all
+# adversarial cases, dragging fault and safety scores down for a reason that had
+# nothing to do with the agent. A ceiling that trims the suite silently is worse
+# than no ceiling, so it sits above a full run rather than inside one.
+DEFAULT_MAX_TOKENS = 600_000
 
 # Which agent to evaluate. Any adapter in app/adapters/ is discovered
 # automatically, so committing one is enough to make it a valid target.
 DEFAULT_TARGET = "langgraph"
+
+# Tasks executed in parallel. The suite is ~30 tasks and each is dominated by
+# waiting on the provider, not by local CPU, so the pool is sized to run the
+# whole suite in one batch: wall-clock time becomes the slowest single task
+# rather than the sum of several rounds. At concurrency 2 the same suite took
+# 33 minutes; at 30 it is bounded by one task's latency.
+#
+# Safe only against a provider tier with real throughput. On a free tier this
+# many simultaneous requests returns 429s that are indistinguishable, in the
+# report, from agent failures -- lower it with --concurrency=N there.
+DEFAULT_CONCURRENCY = 30
 
 # Triage picks the cases a commit needs instead of the whole suite, and is the
 # default path. Every run prints what it selected and why, and writes the same to
@@ -113,9 +130,9 @@ def main():
     suite_name = DEFAULT_SUITE
     max_tokens = DEFAULT_MAX_TOKENS
     target = DEFAULT_TARGET
+    concurrency = DEFAULT_CONCURRENCY
     use_triage = DEFAULT_TRIAGE
     use_advisor = True
-    concurrency = 2
     triaged_regressions = []
     for arg in sys.argv:
         if arg.startswith("--mode="):
@@ -128,14 +145,14 @@ def main():
             max_tokens = int(arg.split("=")[1].strip())
         elif arg.startswith("--target="):
             target = arg.split("=")[1].strip().lower()
+        elif arg.startswith("--concurrency="):
+            concurrency = int(arg.split("=")[1].strip())
         elif arg == "--triage":
             use_triage = True
         elif arg == "--no-triage":
             use_triage = False
         elif arg == "--no-advisor":
             use_advisor = False
-        elif arg.startswith("--concurrency="):
-            concurrency = int(arg.split("=")[1].strip())
         elif arg.startswith("--agent="):
             # Dotted path to a third-party agent, used with --target=external.
             # Read by ExternalAgentAdapter at construction.
@@ -206,10 +223,40 @@ def main():
             print("  (advisor decision replayed from cache for this commit)")
 
         os.makedirs(REPORTS_DIR, exist_ok=True)
+        scope = rationale.get("scope", "all")
         with open(os.path.join(REPORTS_DIR, "triage.json"), "w", encoding="utf-8") as f:
-            _json.dump({**decision.summary(), "suite_size": len(tasks)}, f, indent=2)
+            _json.dump({**decision.summary(), "suite_size": len(tasks),
+                        "scope": scope}, f, indent=2)
 
-        tasks = selected_tasks(tasks, decision) or tasks
+        selected = selected_tasks(tasks, decision)
+
+        # An empty selection has two very different causes, and collapsing them
+        # was `or tasks` -- which discarded every correct "nothing is affected"
+        # answer and ran the full suite anyway. Measured across this repo, that
+        # single fallback put ~29% of files on the full suite despite triage
+        # having decided, correctly, that none of them could change a result.
+        #
+        # scope "none" is a *decision*: the diff is documentation, tests or CI
+        # config, and no task's outcome can move. Running thirty live tasks to
+        # confirm that proves nothing and costs six minutes.
+        #
+        # An empty selection with any other scope is a *malfunction* -- triage
+        # was asked a question it could not answer -- and that still falls back
+        # to the whole suite, because under-selecting silently is the one failure
+        # this project exists to catch.
+        if not selected and scope == "none":
+            print()
+            print("--- No tasks affected by this change ---")
+            print(f"  {decision.rule_reason}")
+            print("  Skipping benchmark execution; there is nothing to measure.")
+            print(f"  Decision recorded in {REPORTS_DIR}/triage.json")
+            return
+
+        if not selected:
+            print(f"  (triage selected nothing under scope={scope!r}; "
+                  f"running the full suite rather than measuring nothing)")
+
+        tasks = selected or tasks
         triaged_regressions = sorted(decision.regressions)
 
     # 2. SET UP FAULT INJECTION
@@ -221,13 +268,26 @@ def main():
     print("\n--- 2. Configuring Fault Injection ---")
     from app.faults.loader import FaultConfigLoader
 
-    fault_specs = faults_for_regressions(triaged_regressions)
-    if fault_specs:
-        print(f"Regressions selected by triage: {', '.join(triaged_regressions)}")
-    else:
-        # No triage, or triage named none. The default set keeps an unqualified
-        # run comparable with the thresholds calibrated against it.
-        fault_specs = DEFAULT_FAULT_CONFIG["faults"]
+    # The default set is a floor, not a fallback. Triage ADDS to it; it never
+    # replaces it -- the same asymmetry the advisor already obeys for tasks.
+    #
+    # It used to replace: a run where triage named two regressions injected only
+    # those two, so the four fault types gate_thresholds.yaml declares
+    # by_fault_type thresholds for were never injected. The gate then failed with
+    # four "NOT MEASURED" violations that said nothing about the agent -- caused
+    # entirely by triage having done its job. Worse, the inverse would be a gate
+    # passing because the regression it checks for was quietly not exercised.
+    default_specs = DEFAULT_FAULT_CONFIG["faults"]
+    extra_specs = [
+        spec for spec in faults_for_regressions(triaged_regressions)
+        if spec.get("id") not in {d.get("id") for d in default_specs}
+    ]
+    fault_specs = default_specs + extra_specs
+
+    if extra_specs:
+        print(f"Regressions added by triage: {', '.join(triaged_regressions)}")
+    print(f"Default fault floor: {len(default_specs)} rules, "
+          f"plus {len(extra_specs)} from triage.")
 
     configs = FaultConfigLoader.load_from_dict(fault_specs)
     fault_engine = FaultInjectionEngine(configs, seed=seed)
@@ -256,9 +316,13 @@ def main():
     print(f"Target '{target}' wrapped in FaultInjectionMiddleware, one adapter per task.")
 
     # 4. RUN BENCHMARK TASKS (Parallel execution with captured telemetry)
+    # Read from the value actually used. This line was hardcoded, so it announced
+    # a concurrency of 2 on runs that used 10 -- and the log was the only place
+    # anyone would have checked.
     print(f"\n--- 4. Executing Benchmark Runner (Concurrency = {concurrency}) ---")
     budget = RunBudget(max_tokens=max_tokens or None)
-    runner = BenchmarkRunner(build_adapter, concurrency=concurrency, max_retries=1, budget=budget)
+    runner = BenchmarkRunner(build_adapter, concurrency=concurrency,
+                             max_retries=1, budget=budget)
 
     # We output to the local workspace
     runner.run_benchmark(tasks, output_dir=REPORTS_DIR)

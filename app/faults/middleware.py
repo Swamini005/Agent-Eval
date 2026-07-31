@@ -38,6 +38,9 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
         self.target = target_adapter
         self.engine = engine
         self.domain = domain
+        # Set by run(): seconds spent inside the agent, excluding time queued on
+        # the tool patch lock. None until the first run.
+        self._agent_seconds: Optional[float] = None
 
     def initialize(self, config: Dict[str, Any]) -> None:
         """
@@ -114,12 +117,32 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
         # cannot interleave start/stop and leave a mock installed after the task
         # that owned it has finished -- that corrupts unrelated tasks, and even
         # later experiment arms in the same process.
+        tool_patches = self._setup_tool_patches()
+
+        # Nothing is patched, so nothing is shared, so nothing needs serialising.
+        # The lock used to be taken unconditionally and held across the whole of
+        # target.run(), so every task in the pool ran one at a time regardless of
+        # the configured concurrency.
+        if not tool_patches:
+            started = time.perf_counter()
+            result = self.target.run(mutated_task, config)
+            self._agent_seconds = time.perf_counter() - started
+            return self._apply_reasoning_faults(result)
+
         with _TOOL_PATCH_LOCK:
-            tool_patches = self._setup_tool_patches()
             for p in tool_patches:
                 p.start()
             try:
+                # Timed inside the lock, deliberately. The runner times run()
+                # from the outside, which includes however long this task queued
+                # behind other tasks' patch windows -- so p95_latency was
+                # reporting lock contention as agent latency, and grew with the
+                # configured concurrency rather than shrinking. Measured here,
+                # the number describes the agent, which is what the gate's
+                # threshold is about.
+                started = time.perf_counter()
                 result = self.target.run(mutated_task, config)
+                self._agent_seconds = time.perf_counter() - started
 
                 # Check for reasoning bypass / shortcut injection in returned state/plan
                 return self._apply_reasoning_faults(result)
@@ -176,7 +199,13 @@ class FaultInjectionMiddleware(BaseAgentAdapter):
         return self.target.get_execution_graph()
 
     def get_metrics(self) -> Dict[str, Any]:
-        return self.target.get_metrics()
+        metrics = dict(self.target.get_metrics())
+        # Time actually spent running the agent, excluding any wait for the tool
+        # patch lock. The runner prefers this over its own wall-clock timing so
+        # latency describes the agent rather than the harness's queueing.
+        if self._agent_seconds is not None:
+            metrics["agent_seconds"] = self._agent_seconds
+        return metrics
 
     def cleanup(self) -> None:
         self.target.cleanup()

@@ -27,3 +27,9 @@ class AgentState(TypedDict):
     
     # The generated assistant response to be displayed
     response: str
+
+    # Set by policy_gate_node when the request tries to override pricing, waive a
+    # fee or claim authority the sender cannot prove. Non-empty means the agent
+    # must refuse: the graph routes straight to the response, and
+    # execute_tool_node refuses to run destructive tools regardless of routing.
+    policy_refusal: str

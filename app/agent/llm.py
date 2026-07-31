@@ -16,6 +16,7 @@ agent that never reached its model, which is precisely the blind spot this
 project exists to close.
 """
 
+from functools import lru_cache
 from typing import Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -53,6 +54,71 @@ def is_deterministic() -> bool:
     return settings.LLM_PROVIDER.lower() == "mock"
 
 
+def thinking_budget_for(model_name: str) -> Optional[int]:
+    """
+    The thinking budget to request, or None to leave the model's default alone.
+
+    Gemini 2.5 Pro cannot have its reasoning disabled -- it enforces a floor of
+    128 tokens and rejects 0 outright -- so a configured 0 is dropped for that
+    family rather than failing every call.
+    """
+    budget = settings.LLM_THINKING_BUDGET
+    if budget is None:
+        return None
+    if budget == 0 and "pro" in (model_name or "").lower():
+        return None
+    return budget
+
+
+@lru_cache(maxsize=None)
+def _build_llm(provider: str, model_name: str, temperature: float) -> BaseChatModel:
+    """
+    Construct a chat model, memoised on the settings that identify it.
+
+    ``get_llm`` is called inside every graph node, so a run built a fresh client
+    -- and a fresh HTTP connection pool -- four or more times per task, ~120
+    times across a thirty-task suite. The clients are configured identically and
+    hold no per-request state, so one instance per (provider, model, temperature)
+    is reused across the runner's threads instead.
+
+    Keyed on the resolved values rather than read from `settings` inside, so a
+    changed setting produces a different client instead of a stale cached one.
+    """
+    if provider == "google":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        # Bounded like the OpenAI-compatible branch. Without a timeout a flaky
+        # connection stalls the whole run: a dropped socket produced no error
+        # and no progress, because nothing ever gave up on the request.
+        # Passed explicitly rather than left to the library's os.environ lookup.
+        # Settings also read .env, so a key configured only there satisfied the
+        # check above and then failed to authenticate -- the one arrangement most
+        # likely to be used, and the failure looked like a bad key.
+        kwargs = {}
+        budget = thinking_budget_for(model_name)
+        if budget is not None:
+            kwargs["thinking_budget"] = budget
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            temperature=temperature,
+            google_api_key=settings.GOOGLE_API_KEY,
+            timeout=settings.LLM_TIMEOUT_SECONDS,
+            max_retries=settings.LLM_MAX_RETRIES,
+            **kwargs,
+        )
+
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(
+        model=model_name,
+        temperature=temperature,
+        api_key=settings.api_key_for(provider),
+        base_url=settings.LLM_BASE_URL or OPENAI_COMPATIBLE_BASE_URLS.get(provider),
+        timeout=settings.LLM_TIMEOUT_SECONDS,
+        max_retries=settings.LLM_MAX_RETRIES,
+    )
+
+
 def get_llm(temperature: Optional[float] = None) -> BaseChatModel:
     """
     Build the configured chat model.
@@ -77,44 +143,21 @@ def get_llm(temperature: Optional[float] = None) -> BaseChatModel:
     temperature = settings.TEMPERATURE if temperature is None else temperature
     model_name = settings.MODEL_NAME or DEFAULT_MODELS.get(provider)
 
+    # Validated before the cache, so a missing key is always reported as a
+    # configuration error rather than being answered from a client built earlier
+    # in the same process.
     if provider == "google":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-
         if not settings.GOOGLE_API_KEY:
             raise ValueError("LLM_PROVIDER=google but GOOGLE_API_KEY is not set.")
-        # Bounded like the OpenAI-compatible branch. Without a timeout a flaky
-        # connection stalls the whole run: a dropped socket produced no error
-        # and no progress, because nothing ever gave up on the request.
-        # Passed explicitly rather than left to the library's os.environ lookup.
-        # Settings also read .env, so a key configured only there satisfied the
-        # check above and then failed to authenticate -- the one arrangement most
-        # likely to be used, and the failure looked like a bad key.
-        return ChatGoogleGenerativeAI(
-            model=model_name,
-            temperature=temperature,
-            google_api_key=settings.GOOGLE_API_KEY,
-            timeout=settings.LLM_TIMEOUT_SECONDS,
-            max_retries=settings.LLM_MAX_RETRIES,
-        )
+        return _build_llm(provider, model_name, temperature)
 
     if provider == "openai" or provider in OPENAI_COMPATIBLE_BASE_URLS:
-        from langchain_openai import ChatOpenAI
-
-        api_key = settings.api_key_for(provider)
-        if not api_key:
+        if not settings.api_key_for(provider):
             raise ValueError(
                 f"LLM_PROVIDER={provider} but no API key is set. "
                 f"Expected {settings.key_env_var(provider)}."
             )
-        base_url = settings.LLM_BASE_URL or OPENAI_COMPATIBLE_BASE_URLS.get(provider)
-        return ChatOpenAI(
-            model=model_name,
-            temperature=temperature,
-            api_key=api_key,
-            base_url=base_url,
-            timeout=settings.LLM_TIMEOUT_SECONDS,
-            max_retries=settings.LLM_MAX_RETRIES,
-        )
+        return _build_llm(provider, model_name, temperature)
 
     raise ValueError(
         f"Unsupported LLM_PROVIDER={provider!r}. "

@@ -3,12 +3,24 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.agent.state import AgentState
 from app.agent.nodes import (
     intent_detection_node,
+    policy_gate_node,
     planner_node,
     tool_selection_node,
     execute_tool_node,
     reasoning_node,
     response_generation_node
 )
+
+
+def route_after_policy_gate(state: AgentState) -> str:
+    """
+    A refused request answers immediately and never reaches the planner.
+
+    Refusing in the final wording while still planning and calling tools is not a
+    refusal -- the booking would already have happened. Skipping straight to the
+    response is what makes the refusal real.
+    """
+    return "response_generation" if state.get("policy_refusal") else "planner"
 
 # Define routing logic
 def route_after_tool_selection(state: AgentState) -> str:
@@ -33,6 +45,7 @@ builder = StateGraph(AgentState)
 
 # Add all modular nodes
 builder.add_node("intent_detection", intent_detection_node)
+builder.add_node("policy_gate", policy_gate_node)
 builder.add_node("planner", planner_node)
 builder.add_node("tool_selection", tool_selection_node)
 builder.add_node("execute_tool", execute_tool_node)
@@ -41,7 +54,19 @@ builder.add_node("response_generation", response_generation_node)
 
 # Set up edges
 builder.add_edge(START, "intent_detection")
-builder.add_edge("intent_detection", "planner")
+builder.add_edge("intent_detection", "policy_gate")
+
+# The gate sits before the planner, so a refused request never produces a plan,
+# never selects a tool and never books anything.
+builder.add_conditional_edges(
+    "policy_gate",
+    route_after_policy_gate,
+    {
+        "planner": "planner",
+        "response_generation": "response_generation"
+    }
+)
+
 builder.add_edge("planner", "tool_selection")
 
 # Conditional edge from tool selection

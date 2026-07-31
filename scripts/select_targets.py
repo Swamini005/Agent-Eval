@@ -58,7 +58,12 @@ def targets_from_changes(paths: list, default: str) -> list:
         if name in INFRASTRUCTURE:
             # A change to the contract affects every agent, so fall back to
             # evaluating all of them rather than guessing.
-            return sorted(registered - {"external"})
+            #
+            # `or [default]` because an adapter that fails to import is absent
+            # from the registry, so a broken dependency can empty this set. CI
+            # loops over the printed list, and an empty list runs the body zero
+            # times -- evaluating nothing while every step reports success.
+            return sorted(registered - {"external"}) or [default]
         if name in registered and name not in selected:
             selected.append(name)
 

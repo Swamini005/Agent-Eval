@@ -38,6 +38,7 @@ GLOBAL_IMPACT_PREFIXES = (
     "regressions.yaml",
     "pricing.yaml",
     "requirements.txt",
+    "demo_pipeline.py",   # wires the faults, budget and runner every task sees
 )
 
 # Build output and caches. Matched anywhere in the path rather than as a prefix,
@@ -65,20 +66,34 @@ NO_IMPACT_PREFIXES = (
 )
 
 
-def changed_files(base_ref: str = "origin/main") -> List[str]:
+def default_base_ref() -> str:
+    """
+    The ref this commit should be compared against.
+
+    On a pull request that is ``origin/main``. On a push to main it is the SHA
+    main pointed at *before* the push, which CI supplies as EVAL_BASE_REF from
+    ``github.event.before`` -- ``origin/main...HEAD`` is empty there because HEAD
+    *is* main, so without this triage sees no diff and runs everything.
+
+    ``HEAD~1`` is deliberately not used as a fallback. It is only equivalent to
+    the previous main when the push contained exactly one commit, and in a repo
+    with shallow history it resolves to the initial import and reports the entire
+    tree as changed -- which escalates every run to the full suite and silently
+    undoes triage.
+    """
+    return os.environ.get("EVAL_BASE_REF") or "origin/main"
+
+
+def changed_files(base_ref: Optional[str] = None) -> List[str]:
     """
     Files changed against a base ref, as forward-slash repo-relative paths.
 
     Returns [] when git cannot answer -- a shallow clone, a missing ref, no git
     at all. Callers treat that as "cannot determine impact" and run everything.
-
-    When pushing directly to main, ``origin/main...HEAD`` is empty because HEAD
-    *is* main. ``HEAD~1`` catches that case by comparing against the previous
-    commit, so triage still narrows the suite.
     """
+    base_ref = base_ref or default_base_ref()
     for args in (["diff", "--name-only", f"{base_ref}...HEAD"],
-                 ["diff", "--name-only", base_ref],
-                 ["diff", "--name-only", "HEAD~1"]):
+                 ["diff", "--name-only", base_ref]):
         try:
             out = subprocess.check_output(
                 ["git", *args], text=True, stderr=subprocess.DEVNULL, timeout=30
@@ -151,7 +166,7 @@ def changed_task_ids(paths: List[str], base_ref: str) -> Set[str]:
 
 def select_affected(
     tasks: List[UnifiedBenchmarkTask],
-    base_ref: str = "origin/main",
+    base_ref: Optional[str] = None,
     paths: Optional[List[str]] = None,
 ) -> Tuple[List[UnifiedBenchmarkTask], Dict[str, Any]]:
     """
@@ -160,6 +175,7 @@ def select_affected(
     Returns (selected, rationale). The rationale is always reported so a short
     run can be seen to be short for a defensible reason rather than by accident.
     """
+    base_ref = base_ref or default_base_ref()
     paths = changed_files(base_ref) if paths is None else paths
 
     if not paths:

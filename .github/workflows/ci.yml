@@ -76,6 +76,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Triage diffs this commit against its base. depth:1 gives it no base
+          # to diff against, so it reports "cannot determine changes" and
+          # escalates every run to the full suite.
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -116,6 +121,16 @@ jobs:
       # whole suite. The deterministic rules floor is always included, so a
       # narrower run is still a defensible gate; the advisor can only widen it.
       - name: Run headless evaluation pipeline
+        env:
+          # What this commit is compared against. On a push, `github.event.before`
+          # is the SHA main pointed at beforehand -- correct however many commits
+          # the push carried. `origin/main...HEAD` cannot be used there, because
+          # on main HEAD *is* origin/main and the diff comes back empty, which
+          # triage reads as "cannot determine impact" and answers with the full
+          # suite. On a pull request origin/main is already the right base.
+          EVAL_BASE_REF: >-
+            ${{ github.event_name == 'push'
+                && github.event.before || 'origin/main' }}
         run: |
           for target in ${{ steps.targets.outputs.list }}; do
             echo "::group::Evaluating $target"
@@ -135,6 +150,10 @@ jobs:
       # A push to main publishes its reports as the baseline every later PR is
       # measured against. Without this the comparison has nothing to compare to,
       # which is why the previous workflow fabricated a baseline with `echo`.
+      # Machine plumbing, not a download: every later PR is measured against this
+      # to answer "is this branch worse than main". Without it the comparison has
+      # nothing to compare to. It holds two small JSON files, not the run's
+      # reports -- those are in the job summary now.
       - name: Publish baseline (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
@@ -204,49 +223,35 @@ jobs:
           git -c user.name="github-actions[bot]"               -c user.email="github-actions[bot]@users.noreply.github.com"               commit -q -m "eval: ${{ github.event_name }} ${{ github.sha }}"
           git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" eval-results
 
-      - name: Publish evaluation summary
+      # gate_check writes the full result -- every threshold with the value
+      # measured against it, the suite metrics, the triage decision and the
+      # diagnostics for each failing task -- straight to the job summary. This
+      # step only adds what it cannot: the branch-vs-main comparison, and a
+      # notice when the pipeline died before producing anything to report.
+      - name: Publish comparison and failure notice
         if: always()
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import json
           import os
 
-          print("## Agent Evaluation Summary\n")
-
           if not os.path.exists("reports/evaluation_summary.json"):
-              print("_No evaluation summary was produced -- the pipeline failed before reporting._")
+              print("## Agent Evaluation Summary\n")
+              print("_No evaluation summary was produced -- the pipeline failed "
+                    "before reporting. Nothing was measured; this is not a pass._")
               raise SystemExit(0)
 
-          with open("reports/evaluation_summary.json", encoding="utf-8") as fh:
-              summary = json.load(fh)
-
-          print(f"**Global average score:** {summary.get('global_average_score', 'n/a')}")
-          print(f"**Tasks evaluated:** {summary.get('total_tasks_evaluated', 'n/a')}\n")
-          print("| Metric | Score |")
-          print("| --- | --- |")
-          for name, score in summary.get("summary_metrics", {}).items():
-              print(f"| {name.replace('_', ' ').title()} | {score} |")
-
           if os.path.exists("reports/comparison.md"):
-              print()
               with open("reports/comparison.md", encoding="utf-8") as cmp_fh:
                   print(cmp_fh.read())
           PY
 
+      # No evaluation-reports artifact. Everything a reader needed from it is in
+      # the job summary, and a 42 KB zip that has to be downloaded and unpacked
+      # to find out why a build went red is a worse way to say the same thing.
       - name: Fail the build if the gate failed
-        # Deferred to here so the result is published and artifacts uploaded
-        # first; the build still goes red.
+        # Deferred to here so the summary is published first; the build still
+        # goes red.
         if: steps.gate.outcome == 'failure'
         run: |
           echo "::error::Evaluation gate failed. See the summary above."
           exit 1
-
-      - name: Upload evaluation reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: evaluation-reports
-          if-no-files-found: warn
-          path: |
-            pytest-report.xml
-            reports/

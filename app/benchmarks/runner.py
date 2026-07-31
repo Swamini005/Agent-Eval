@@ -192,6 +192,16 @@ class BenchmarkRunner:
                 metrics = agent_adapter.get_metrics()
                 retrieval_documents = agent_adapter.get_retrieval_documents()
 
+                # Prefer the adapter's own measurement of how long the agent ran.
+                # The wall clock above spans the whole call, which for a
+                # fault-injected run includes waiting for the process-global tool
+                # patch lock -- so p95 latency grew with concurrency and described
+                # the harness queueing tasks rather than the agent being slow. The
+                # gate's latency threshold is a statement about the agent, so it
+                # has to be measured on the agent.
+                if "agent_seconds" in metrics:
+                    duration = metrics["agent_seconds"]
+
                 # Prefer what the provider actually reported. Fall back to a
                 # character-count estimate only when it reported nothing, and
                 # label which one was used -- pricing an estimate without saying
