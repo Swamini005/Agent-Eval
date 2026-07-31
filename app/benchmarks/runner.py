@@ -14,6 +14,43 @@ logger = logging.getLogger(__name__)
 
 AdapterFactory = Callable[[str], BaseAgentAdapter]
 
+
+def _failed_record(
+    task: "UnifiedBenchmarkTask",
+    errors: List[str],
+    *,
+    trace_id: str = "",
+    deep_link: str = "",
+) -> Dict[str, Any]:
+    """Build a complete failure record with every key the evaluation stage reads.
+
+    Must stay in sync with the success dict returned by
+    ``_execute_task_with_retries`` -- any field the downstream
+    ``EvaluationExecutionInput`` constructor accesses via ``e["..."]`` must be
+    present here, otherwise the pipeline crashes *after* spending real budget.
+    """
+    return {
+        "task_id": task.id,
+        "benchmark": task.benchmark,
+        "category": task.category,
+        "prompt": task.prompt,
+        "response": "",
+        "tool_calls": [],
+        "execution_graph": {"nodes": [], "edges": []},
+        "latency_seconds": 0.0,
+        "cost_usd": 0.0,
+        "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "token_source": "none",
+        "errors": errors,
+        "memory_state": [],
+        "retrieval_documents": [],
+        "reasoning_nodes": [],
+        "success": False,
+        "attempts": 0,
+        "langfuse_trace_id": trace_id,
+        "langfuse_deep_link": deep_link,
+    }
+
 class BenchmarkRunner:
     """
     Harbor-compatible Benchmark Runner.
@@ -77,19 +114,11 @@ class BenchmarkRunner:
                     # Not an agent failure. Recorded once and reported as the
                     # reason the run is incomplete.
                     budget_error = str(e)
-                    results.append({
-                        "task_id": task.id,
-                        "benchmark": task.benchmark,
-                        "success": False,
-                        "errors": [f"Budget exceeded: {e}"]
-                    })
+                    results.append(_failed_record(task, [f"Budget exceeded: {e}"]))
                 except Exception as e:
-                    results.append({
-                        "task_id": task.id,
-                        "benchmark": task.benchmark,
-                        "success": False,
-                        "errors": [f"ThreadPool Execution crashed: {str(e)}"]
-                    })
+                    results.append(
+                        _failed_record(task, [f"ThreadPool Execution crashed: {e}"])
+                    )
                     
         # Output reports
         output_payload = {
