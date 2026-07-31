@@ -1,0 +1,19 @@
+name: v1_tool_selection
+description: >
+  Broadens the keyword triggers for the policy-retrieval tool.
+
+  Found by the suite, not by guessing: dev-context-05 asks "how many hours before
+  departure can I change my ticket free of charge", which reaches none of the
+  baseline triggers (policy / refund / cancel / change rule / fee), so the agent
+  answered without retrieving anything.
+
+extra_tool_triggers:
+  get_policy_document:
+    - "change my ticket"
+    - "free of charge"
+    - "before departure"
+    - "baggage"
+    - "administrative"
+policy_guard: false
+retry_on_tool_error: false
+max_tool_calls: null

@@ -1,0 +1,21 @@
+# Theme is declared here rather than injected as CSS from the app.
+#
+# The dashboard previously wrote a <style> block overriding Streamlit's own
+# classes by name (.css-1542z7w and similar). Those names are build hashes and
+# change between Streamlit releases, so the styling silently stopped applying on
+# upgrade while continuing to look intentional. Configuration is the supported
+# surface and survives version changes.
+
+[theme]
+base = "dark"
+primaryColor = "#2563EB"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1A1C23"
+textColor = "#FAFAFA"
+
+[server]
+# The dashboard reads generated reports; it never accepts uploads.
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false

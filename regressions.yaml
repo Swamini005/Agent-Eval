@@ -60,6 +60,34 @@ regressions:
         scheduling: {}
         parameters: {}
 
+  - label: malformed_tool_output
+    description: >
+      Restaurant search returns XML instead of parsed results. Should be caught
+      by tasks asserting on that tool's output content.
+    faults:
+      - id: R5-MALFORMED-OUTPUT
+        type: malformed_tool_output
+        component: tool
+        severity: warning
+        probability: 1.0
+        scheduling: {}
+        parameters: {}
+
+  - label: partial_tool_failure
+    description: >
+      Smallest correctness regression in the catalogue: flight search fails while
+      every other tool keeps working, so only the subset of tasks depending on it
+      should move. Included to probe the low end of the detection curve, which is
+      what sets the minimum detectable effect.
+    faults:
+      - id: R6-PARTIAL-FAILURE
+        type: random_tool_failure
+        component: tool
+        severity: info
+        probability: 0.5
+        scheduling: {}
+        parameters: {}
+
   - label: tool_latency
     description: >
       Adds a fixed delay without changing any output. Deliberately the weakest

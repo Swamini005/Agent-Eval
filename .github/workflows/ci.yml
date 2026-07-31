@@ -11,9 +11,18 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      provider:
+        description: "Model provider for the agent under test"
+        type: choice
+        default: mock
+        options: [mock, google, openai, groq]
 
 permissions:
-  contents: read
+  # Writing the eval-results branch, which carries the history the deployed
+  # dashboard reads. Nothing else is written: that branch is orphaned and holds
+  # no source.
+  contents: write
   # Reading artifacts from previous runs on main, to compare a PR against the
   # last known-good baseline.
   actions: read
@@ -23,11 +32,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Forces app/agent/nodes.py:get_llm() to raise immediately so every node takes
-  # its deterministic rule-based fallback. Without this the default provider is
-  # "google" (app/config.py) and each node waits on a network call that will fail
-  # anyway -- which blows the p95_latency gate non-deterministically.
-  LLM_PROVIDER: mock
+  # The gate runs against the deterministic rule-based path by default. That is
+  # not timidity: gate_thresholds.yaml includes p95_latency, and a real model's
+  # latency varies enough between runs to fail a gate on an unchanged commit --
+  # so every push would be a coin toss and the signal would be worthless. It also
+  # keeps CI free and keyless for forks.
+  #
+  # Run the workflow manually with provider=google to evaluate against a live
+  # model, which is what a demo wants.
   PYTHONUNBUFFERED: "1"
   # DeepEval reports usage to a third party by default; an evaluation harness
   # should not transmit anything about the runs it measures.
@@ -38,7 +50,28 @@ jobs:
   test-and-evaluate:
     name: Tests + Evaluation Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+
+    env:
+      # Evaluate against the live model when the key is configured, and fall back
+      # to deterministic mock mode when it is not -- which is what forked pull
+      # requests get, since GitHub withholds secrets from them. `secrets` is not
+      # available in workflow-level env, so this block has to live on the job.
+      #
+      # A live provider makes the run non-deterministic, so the gate reads
+      # p95_latency_real_model (60s) rather than the 0.25s mock threshold.
+      # See app/evaluation/gate_thresholds.yaml.
+      LLM_PROVIDER: >-
+        ${{ github.event.inputs.provider
+            || (secrets.GOOGLE_API_KEY != '' && 'google' || 'mock') }}
+      MODEL_NAME: ${{ vars.MODEL_NAME || 'gemini-2.5-flash' }}
+
+      # Set even on a mock run: an agent handed over for evaluation calls its own
+      # model directly rather than going through app/agent/llm.py, so without the
+      # key it fails every task and the report reads as a broken agent.
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
     steps:
       - name: Checkout repository
@@ -65,10 +98,37 @@ jobs:
         # no API key -- DeepEval supplies the runner and the exit code only.
         run: deepeval test run tests/test_deepeval_suite.py
 
+      # A commit that adds or changes an adapter under app/adapters/ is evaluated
+      # against *that* adapter. Without this, CI always runs the default target
+      # and a newly committed agent is never measured -- which in the report is
+      # indistinguishable from an agent that has no problems.
+      - name: Select agents to evaluate
+        id: targets
+        run: |
+          git fetch origin main --depth=50 2>/dev/null || true
+          targets=$(python -m scripts.select_targets --base=origin/main --default=langgraph)
+          echo "Evaluating: $targets"
+          # echo without quotes collapses the newlines into spaces, so the list
+          # survives as a single GITHUB_OUTPUT value.
+          echo "list=$(echo $targets)" >> "$GITHUB_OUTPUT"
+
+      # --triage: the run evaluates the cases this commit needs rather than the
+      # whole suite. The deterministic rules floor is always included, so a
+      # narrower run is still a defensible gate; the advisor can only widen it.
       - name: Run headless evaluation pipeline
-        run: python demo_pipeline.py --mode=ci
+        run: |
+          for target in ${{ steps.targets.outputs.list }}; do
+            echo "::group::Evaluating $target"
+            python demo_pipeline.py --mode=ci --triage --target="$target"
+            echo "::endgroup::"
+          done
 
       - name: Run CI verification gate check
+        id: gate
+        # continue-on-error so a red gate is still published to the dashboard --
+        # a failing run is exactly the one worth seeing there. The job is failed
+        # explicitly at the end.
+        continue-on-error: true
         run: python -m app.evaluation.gate_check
 
       # --- Baseline comparison -------------------------------------------
@@ -112,6 +172,38 @@ jobs:
         run: |
           python -m app.evaluation.comparator             --baseline-summary baseline/evaluation_summary.json             --candidate-summary reports/evaluation_summary.json             --baseline-agent baseline/agent_report.json             --candidate-agent reports/agent_report.json             --output-dir reports
 
+      # --- Dashboard history ----------------------------------------------
+      # A deployed dashboard cannot see this runner's filesystem, so each run
+      # appends its summary to an orphan `eval-results` branch that the Streamlit
+      # app fetches over HTTP. Append-only, so concurrent runs cannot corrupt
+      # earlier history.
+      - name: Publish result to the dashboard history
+        # Skipped for forked PRs, where GITHUB_TOKEN is read-only and the push
+        # would fail. Their results still appear in the step summary.
+        if: always() && github.event.pull_request.head.repo.fork != true
+        env:
+          GATE_PASSED: ${{ steps.gate.outcome == 'success' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Work in a detached copy so the checked-out source tree is untouched.
+          git fetch origin eval-results --depth=1 2>/dev/null || true
+          rm -rf .results && mkdir -p .results
+          if git show-ref --verify --quiet refs/remotes/origin/eval-results; then
+            git --work-tree=.results checkout origin/eval-results -- . 2>/dev/null || true
+          fi
+
+          python -m scripts.publish_results             --out .results/results/history.jsonl             --gate-passed "$GATE_PASSED"
+
+          cd .results
+          git init -q
+          git checkout -q -b eval-results
+          git add -A
+          git -c user.name="github-actions[bot]"               -c user.email="github-actions[bot]@users.noreply.github.com"               commit -q -m "eval: ${{ github.event_name }} ${{ github.sha }}"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" eval-results
+
       - name: Publish evaluation summary
         if: always()
         run: |
@@ -140,6 +232,14 @@ jobs:
               with open("reports/comparison.md", encoding="utf-8") as cmp_fh:
                   print(cmp_fh.read())
           PY
+
+      - name: Fail the build if the gate failed
+        # Deferred to here so the result is published and artifacts uploaded
+        # first; the build still goes red.
+        if: steps.gate.outcome == 'failure'
+        run: |
+          echo "::error::Evaluation gate failed. See the summary above."
+          exit 1
 
       - name: Upload evaluation reports
         if: always()

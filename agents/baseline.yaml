@@ -1,0 +1,13 @@
+name: baseline
+description: >
+  Frozen v0. The agent as first written, before the evaluation suite was used to
+  find anything. Every later variant is measured against this, and its hash is
+  committed alongside the task set so the comparison cannot be reframed after the
+  fact.
+
+# No improvements enabled. Fields are listed explicitly rather than omitted so a
+# diff against a later variant shows exactly what changed.
+extra_tool_triggers: {}
+policy_guard: false
+retry_on_tool_error: false
+max_tool_calls: null

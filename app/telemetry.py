@@ -1,6 +1,9 @@
+import logging
 import os
 import uuid
 from typing import Dict, Any, Optional, List
+
+logger = logging.getLogger(__name__)
 
 try:
     from langfuse import Langfuse
@@ -37,11 +40,11 @@ class LangfuseTracker:
                     host=self.host
                 )
                 self.enabled = True
-                print("Langfuse telemetry tracing enabled.")
+                logger.info("Langfuse tracing enabled.")
             except Exception as e:
-                print(f"Failed to initialize Langfuse client: {e}. Falling back to mock logger.")
+                logger.warning("Langfuse client init failed (%s); tracing disabled.", e)
         else:
-            print("Langfuse credentials missing. Telemetry running in mock mode.")
+            logger.debug("No Langfuse credentials; tracing disabled.")
 
     def create_trace(
         self,
@@ -121,9 +124,10 @@ class LangfuseTracker:
                     }
                 )
             except Exception as e:
-                print(f"Error logging Langfuse score: {e}")
+                logger.warning("Langfuse score not recorded: %s", e)
         else:
-            print(f"[Mock Log] Trace {trace_id} evaluated. Score: {score}, Tool Coverage: {tool_coverage}, Faults Injected: {len(injected_faults)}")
+            logger.debug("Trace %s scored %.3f (tool coverage %.3f, %d faults)",
+                         trace_id, score, tool_coverage, len(injected_faults))
 
     def log_span(
         self,
@@ -146,9 +150,9 @@ class LangfuseTracker:
                 )
                 # Automatically closes
             except Exception as e:
-                print(f"Error logging Langfuse span: {e}")
+                logger.warning("Langfuse span not recorded: %s", e)
         else:
-            print(f"[Mock Log] Trace {trace_id} span '{span_name}' executed in {latency:.3f}s")
+            logger.debug("Trace %s span %s took %.3fs", trace_id, span_name, latency)
             
 # Global telemetry tracker instance
 telemetry_tracker = LangfuseTracker()

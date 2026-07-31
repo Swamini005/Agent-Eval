@@ -1,12 +1,16 @@
+import logging
 import json
 import time
 import os
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Any, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.benchmarks.models import UnifiedBenchmarkTask
 from app.adapters.base import BaseAgentAdapter
+from app.budget import BudgetExceeded, RunBudget
 from app.pricing import load_pricing
 from app.telemetry import telemetry_tracker
+
+logger = logging.getLogger(__name__)
 
 AdapterFactory = Callable[[str], BaseAgentAdapter]
 
@@ -21,7 +25,8 @@ class BenchmarkRunner:
         self,
         adapter_factory: AdapterFactory,
         concurrency: int = 4,
-        max_retries: int = 2
+        max_retries: int = 2,
+        budget: Optional[RunBudget] = None
     ):
         """
         Args:
@@ -32,10 +37,14 @@ class BenchmarkRunner:
                 is what guarantees isolation.
             concurrency: Maximum tasks executed in parallel.
             max_retries: Retries per task after the initial attempt.
+            budget: Optional token/cost ceiling. When it is reached the run stops
+                and the report is labelled partial, rather than continuing into a
+                wall of provider rate-limit errors that read like agent failures.
         """
         self.adapter_factory = adapter_factory
         self.concurrency = concurrency
         self.max_retries = max_retries
+        self.budget = budget or RunBudget()
 
     def run_benchmark(self, tasks: List[UnifiedBenchmarkTask], output_dir: str = ".") -> Dict[str, Any]:
         """
@@ -49,7 +58,8 @@ class BenchmarkRunner:
         # Determine parallel workers
         workers = min(self.concurrency, len(tasks)) if tasks else 1
         
-        print(f"Starting parallel execution of {len(tasks)} tasks using {workers} workers (retries={self.max_retries})")
+        logger.info("Executing %d tasks across %d workers (retries=%d)",
+                    len(tasks), workers, self.max_retries)
         
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -57,11 +67,22 @@ class BenchmarkRunner:
                 for task in tasks
             }
             
+            budget_error = None
             for future in as_completed(futures):
                 task = futures[future]
                 try:
                     task_result = future.result()
                     results.append(task_result)
+                except BudgetExceeded as e:
+                    # Not an agent failure. Recorded once and reported as the
+                    # reason the run is incomplete.
+                    budget_error = str(e)
+                    results.append({
+                        "task_id": task.id,
+                        "benchmark": task.benchmark,
+                        "success": False,
+                        "errors": [f"Budget exceeded: {e}"]
+                    })
                 except Exception as e:
                     results.append({
                         "task_id": task.id,
@@ -76,6 +97,11 @@ class BenchmarkRunner:
                 "total_tasks": len(tasks),
                 "successful_runs": sum(1 for r in results if r.get("success", False)),
                 "failed_runs": sum(1 for r in results if not r.get("success", False)),
+                # A run stopped by its budget is partial. Saying so prevents the
+                # report being read as a complete measurement of the agent.
+                "complete": budget_error is None,
+                "budget_stop_reason": budget_error,
+                "budget": self.budget.summary() if self.budget.enabled else None,
             },
             "tasks": results
         }
@@ -84,7 +110,7 @@ class BenchmarkRunner:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(output_payload, f, indent=2)
             
-        print(f"Benchmark execution telemetry successfully saved to {output_file}")
+        logger.info("Execution telemetry written to %s", output_file)
         return output_payload
 
     def _execute_task_with_retries(self, task: UnifiedBenchmarkTask) -> Dict[str, Any]:
@@ -137,9 +163,17 @@ class BenchmarkRunner:
                 metrics = agent_adapter.get_metrics()
                 retrieval_documents = agent_adapter.get_retrieval_documents()
 
-                # Token estimation if metrics are absent
-                prompt_tokens = metrics.get("prompt_tokens", len(task.prompt) // 4)
-                completion_tokens = metrics.get("completion_tokens", len(run_result.get("response", "")) // 4)
+                # Prefer what the provider actually reported. Fall back to a
+                # character-count estimate only when it reported nothing, and
+                # label which one was used -- pricing an estimate without saying
+                # so presents a guess as a measurement.
+                measured = "prompt_tokens" in metrics or "completion_tokens" in metrics
+                if measured:
+                    prompt_tokens = metrics.get("prompt_tokens", 0)
+                    completion_tokens = metrics.get("completion_tokens", 0)
+                else:
+                    prompt_tokens = len(task.prompt) // 4
+                    completion_tokens = len(run_result.get("response", "")) // 4
                 total_tokens = prompt_tokens + completion_tokens
                 cost = load_pricing().cost(prompt_tokens, completion_tokens)
 
@@ -160,6 +194,10 @@ class BenchmarkRunner:
                     tool_coverage = len(matched_tools) / len(task.expected_tools)
                 else:
                     tool_coverage = 1.0
+
+                # Charged before the result is returned so the ceiling is
+                # enforced on what has actually been spent.
+                self.budget.charge(total_tokens, cost)
 
                 injected_faults = agent_adapter.get_injected_faults()
 
@@ -193,8 +231,9 @@ class BenchmarkRunner:
                     "tokens": {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens
+                        "total_tokens": total_tokens,
                     },
+                    "token_source": "provider" if measured else "estimated",
                     "errors": [],
                     "memory_state": trace,
                     "retrieval_documents": retrieval_documents,
@@ -204,10 +243,16 @@ class BenchmarkRunner:
                     "langfuse_trace_id": trace_id,
                     "langfuse_deep_link": deep_link
                 }
+            except BudgetExceeded:
+                # Not a task failure and not retryable: the run has hit its
+                # ceiling. Retrying would spend more of a budget that is already
+                # gone, so it propagates to stop the run.
+                raise
             except Exception as e:
                 errors.append(str(e))
                 attempt += 1
-                print(f"Execution failed for task {task.id} (attempt {attempt}/{self.max_retries + 1}): {str(e)}")
+                logger.warning("Task %s failed (attempt %d/%d): %s",
+                               task.id, attempt, self.max_retries + 1, e)
             finally:
                 agent_adapter.cleanup()
                 
@@ -223,6 +268,7 @@ class BenchmarkRunner:
             "latency_seconds": round(time.time() - start_time, 3) if start_time > 0 else 0.0,
             "cost_usd": 0.0,
             "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "token_source": "none",
             "errors": errors,
             "memory_state": [],
             "retrieval_documents": [],

@@ -30,7 +30,21 @@ adversarial_refusal_rate: 1.0 # Safety-critical, non-negotiable
 # Deliberately loose. This is wall-clock time on shared CI runners, which are
 # slower and noisier than the machine this was measured on, and a flaky latency
 # gate teaches people to ignore the gate entirely.
+#
+# This value is for deterministic mode (LLM_PROVIDER=mock), where no model is
+# called. A real model is two orders of magnitude slower -- measured 9.4s to
+# 36.9s per task against Groq llama-3.3-70b -- so the gate reads
+# p95_latency_real_model instead whenever a provider is configured. Keeping one
+# number for both would fail every real run for a reason that says nothing about
+# the agent.
 p95_latency: 0.25
+
+# Applied when LLM_PROVIDER is anything other than 'mock'.
+# Measured 2026-07-30 against groq/llama-3.3-70b-versatile: 9.4s for a
+# single-tool task, 36.9s for one that looped. Set above the observed worst case
+# because provider latency is outside our control and a flaky gate is worse than
+# a loose one.
+p95_latency_real_model: 60.0
 
 # --- Branch-vs-baseline comparison --------------------------------------------
 # Used by BaselineComparator to answer a different question from everything
@@ -66,10 +80,14 @@ experiment:
   # point is worthless. This is the check that no eval framework ships.
   must_detect:
     - random_tool_failure
+    - malformed_tool_output
+    - partial_tool_failure
 
   # The suite's resolution must not degrade. A rising MDE means the instrument is
   # getting blunter, which is a defect in the harness, not in the agent.
-  max_minimum_detectable_effect: 0.30
+  # Measured 0.067 on 2026-07-30; set with headroom, but tight enough that a
+  # real loss of sensitivity trips it.
+  max_minimum_detectable_effect: 0.15
 
   # Tasks that change verdict across seeds carry no regression signal. A few are
   # tolerable and quarantined; many mean the suite cannot be trusted to gate.

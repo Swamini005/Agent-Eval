@@ -80,3 +80,62 @@ def test_evaluation_engine_metrics_and_reports(tmp_path):
         summary = json.load(f)
         assert summary["total_tasks_evaluated"] == 1
         assert "global_average_score" in summary
+
+
+def test_a_task_with_no_expected_answer_is_unmeasured_not_scored():
+    """`target in actual` is trivially true for an empty target.
+
+    A task declaring no expected answer scored 0.4 for arbitrary output, and a
+    full 1.0 when the agent returned nothing at all -- so the emptiest possible
+    response was the highest scoring one. Nothing to compare against is not the
+    same as a wrong answer, and must be excluded from the aggregate instead.
+    """
+    from app.evaluation.metrics.accuracy import AccuracyMetric
+    from app.evaluation.models import EvaluationTaskInput, EvaluationExecutionInput
+
+    def evaluate(expected, response):
+        task = EvaluationTaskInput(task_id="x", benchmark="b", category="c", difficulty="easy",
+                                   domain="travel", prompt="p", expected_answer=expected)
+        execution = EvaluationExecutionInput(
+            task_id="x", category="c", response=response, latency_seconds=1.0, cost_usd=0.0,
+            tool_calls=[], tokens={}, memory_state=[], retrieval_documents=[],
+            reasoning_nodes=[], errors=[])
+        return AccuracyMetric().evaluate(task, execution, {})
+
+    for response in ("", "complete nonsense"):
+        result = evaluate("", response)
+        assert result.measured is False, response
+
+    # A real reference answer is still scored normally.
+    assert evaluate("450 dollars", "450 dollars").measured is True
+    assert evaluate("450 dollars", "450 dollars").score == 1.0
+
+
+def test_a_crashed_task_is_not_scored_as_fast_and_cheap():
+    """The faster an agent failed, the better it looked.
+
+    Performance is latency plus cost, and a task that errored returns instantly
+    and costs nothing -- so a run whose every task failed reported performance
+    1.0 and pulled the global average up with it. Speed cannot be measured on an
+    execution that never happened.
+    """
+    from app.evaluation.metrics.performance import PerformanceMetric
+    from app.evaluation.models import EvaluationTaskInput, EvaluationExecutionInput
+
+    task = EvaluationTaskInput(task_id="x", benchmark="b", category="c", difficulty="easy",
+                               domain="travel", prompt="p", expected_answer="a")
+
+    def run(response, errors):
+        execution = EvaluationExecutionInput(
+            task_id="x", category="c", response=response, latency_seconds=0.001,
+            cost_usd=0.0, tool_calls=[], tokens={}, memory_state=[],
+            retrieval_documents=[], reasoning_nodes=[], errors=errors)
+        return PerformanceMetric().evaluate(task, execution, {})
+
+    crashed = run("", ["API key required for Gemini Developer API"])
+    assert crashed.measured is False
+
+    # A genuinely fast successful run is still scored, and scored well.
+    succeeded = run("the answer", [])
+    assert succeeded.measured is True
+    assert succeeded.score > 0.9

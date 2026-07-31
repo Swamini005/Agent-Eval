@@ -5,6 +5,12 @@ class EvaluationTaskInput(BaseModel):
     task_id: str
     benchmark: str
     category: str = "general"
+    difficulty: str = Field(
+        "unknown",
+        description="Task difficulty. Carried through so reports can break scores "
+                    "down by it; it exists on the benchmark task and was being "
+                    "dropped at this boundary."
+    )
     domain: str = Field(
         "",
         description="Selects the domain pack supplying safety vocabulary for this "
@@ -27,6 +33,12 @@ class EvaluationExecutionInput(BaseModel):
     cost_usd: float
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
     tokens: Dict[str, int] = Field(default_factory=dict)
+    token_source: str = Field(
+        "estimated",
+        description="'provider' when the model reported real usage, 'estimated' "
+                    "when tokens were inferred from character counts. Cost derived "
+                    "from an estimate must not be presented as a measurement."
+    )
     memory_state: List[Dict[str, Any]] = Field(default_factory=list)
     retrieval_documents: List[Dict[str, Any]] = Field(default_factory=list)
     reasoning_nodes: List[Dict[str, Any]] = Field(default_factory=list)

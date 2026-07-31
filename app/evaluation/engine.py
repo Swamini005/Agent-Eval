@@ -1,10 +1,13 @@
+import logging
 import json
 import os
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from app.evaluation.models import EvaluationTaskInput, EvaluationExecutionInput, MetricResult
 from app.evaluation.metrics.registry import MetricRegistry
-from app.pricing import load_pricing
+from app.pricing import active_model, has_rate
+
+logger = logging.getLogger(__name__)
 
 class EvaluationEngine:
     """
@@ -77,7 +80,7 @@ class EvaluationEngine:
                     # agent. Recording 0.0 would make a bug in the harness look
                     # like a failing agent, so it is tracked separately and left
                     # out of the aggregate.
-                    print(f"Error evaluating metric {metric.__class__.__name__}: {e}")
+                    logger.error("Metric %s raised: %s", metric.__class__.__name__, e)
                     errored.append({"metric": metric.__class__.__name__, "error": str(e)})
 
             # Overall score averages only what was actually measured.
@@ -92,6 +95,11 @@ class EvaluationEngine:
             task_results.append({
                 "task_id": task.task_id,
                 "benchmark": task.benchmark,
+                # Reported so results can be grouped without rejoining against
+                # the task file.
+                "category": task.category,
+                "difficulty": task.difficulty,
+                "domain": task.domain,
                 "prompt": task.prompt,
                 "overall_score": overall_score,
                 "metrics": scores,
@@ -153,7 +161,13 @@ class EvaluationEngine:
                 "average_cost_usd": round(avg_cost, 8),
                 "average_total_tokens": round(avg_tokens, 1),
                 "total_runs": len(executions),
-                "pricing_model": load_pricing().default_model,
+                "pricing_model": active_model(),
+                # False means the cost figures above are zero because no rate is
+                # published for this model, not because the run was free.
+                "pricing_model_priced": has_rate(),
+                # "provider" when the model reported real usage, "estimated"
+                # when tokens were inferred from character counts.
+                "token_source": executions[0].token_source if executions else None,
                 "tasks_passed": len(passed),
                 "cost_per_successful_task_usd": (
                     round(total_cost / len(passed), 8) if passed else None
@@ -258,7 +272,7 @@ class EvaluationEngine:
         #    other reports are overwritten in place on every execution.
         self._append_run_history(output_dir, summary, agent_report)
 
-        print("Generated results.json, benchmark_report.json, agent_report.json, and evaluation_summary.json")
+        logger.info("Evaluation reports written to %s", output_dir)
         
         return {
             "results": task_results,

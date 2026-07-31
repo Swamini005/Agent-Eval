@@ -4,27 +4,71 @@
 # providers change them, and so a report states which price list produced its
 # cost figures.
 #
-# Runs in mock mode spend nothing. Costing them at a real model's published rates
-# gives a *shadow cost*: what this suite would cost against that model. That is
-# the number worth tracking, because it changes when the agent starts using more
-# tokens even while local spend stays zero.
+# Two layers of lookup:
+#
+#   models:   exact name match, checked first
+#   families: prefix match, checked when no exact entry exists
+#
+# The prefix layer is what keeps this from breaking every time a provider ships
+# a new point release. `gemini-3.5-flash-lite-preview-0409` has no exact entry
+# but matches the `gemini-3.5-flash-lite` family, so it is priced rather than
+# silently costed at zero. A model matching nothing is reported as unpriced --
+# see has_rate() -- because $0.00 reads as "free" and would be a fabricated
+# number in a cost report.
+#
+# VERIFY THESE against the provider's published rates before quoting them.
+# Last checked: 2026-07-30.
 
-default_model: gemini-1.5-flash
+default_model: gemini-2.5-flash
 
 models:
-  gemini-1.5-flash:
-    prompt_per_1m: 0.075
-    completion_per_1m: 0.30
-  gemini-1.5-pro:
-    prompt_per_1m: 1.25
-    completion_per_1m: 5.00
-  gpt-4o-mini:
-    prompt_per_1m: 0.15
-    completion_per_1m: 0.60
-  gpt-4o:
-    prompt_per_1m: 2.50
-    completion_per_1m: 10.00
-  # Explicit zero-rate entry for measuring token volume without shadow costing.
+  # Explicit zero-rate entry, for measuring token volume without shadow costing.
   mock:
     prompt_per_1m: 0.0
     completion_per_1m: 0.0
+
+# Prefix families, longest match wins. A new variant of a known family inherits
+# its rate instead of falling through to "unpriced".
+families:
+  # --- Google Gemini ------------------------------------------------------
+  gemini-3.1-pro:          {prompt_per_1m: 2.00, completion_per_1m: 12.00}
+  gemini-3.6-flash:        {prompt_per_1m: 1.50, completion_per_1m: 7.50}
+  gemini-3.5-flash-lite:   {prompt_per_1m: 0.50, completion_per_1m: 3.00}
+  gemini-3.5-flash:        {prompt_per_1m: 1.50, completion_per_1m: 9.00}
+  gemini-3.1-flash-lite:   {prompt_per_1m: 0.50, completion_per_1m: 3.00}
+  gemini-3-flash:          {prompt_per_1m: 1.50, completion_per_1m: 7.50}
+  gemini-3-pro:            {prompt_per_1m: 2.00, completion_per_1m: 12.00}
+  gemini-2.5-flash-lite:   {prompt_per_1m: 0.10, completion_per_1m: 0.40}
+  gemini-2.5-flash:        {prompt_per_1m: 0.30, completion_per_1m: 2.50}
+  gemini-2.5-pro:          {prompt_per_1m: 1.25, completion_per_1m: 10.00}
+  gemini-2.0-flash-lite:   {prompt_per_1m: 0.075, completion_per_1m: 0.30}
+  gemini-2.0-flash:        {prompt_per_1m: 0.10, completion_per_1m: 0.40}
+
+  # --- OpenAI -------------------------------------------------------------
+  gpt-5:                   {prompt_per_1m: 1.25, completion_per_1m: 10.00}
+  gpt-4.1-nano:            {prompt_per_1m: 0.10, completion_per_1m: 0.40}
+  gpt-4.1-mini:            {prompt_per_1m: 0.40, completion_per_1m: 1.60}
+  gpt-4.1:                 {prompt_per_1m: 2.00, completion_per_1m: 8.00}
+  gpt-4o-mini:             {prompt_per_1m: 0.15, completion_per_1m: 0.60}
+  gpt-4o:                  {prompt_per_1m: 2.50, completion_per_1m: 10.00}
+  o4-mini:                 {prompt_per_1m: 1.10, completion_per_1m: 4.40}
+  o3-mini:                 {prompt_per_1m: 1.10, completion_per_1m: 4.40}
+  o3:                      {prompt_per_1m: 2.00, completion_per_1m: 8.00}
+
+  # --- Anthropic ----------------------------------------------------------
+  claude-opus-4:           {prompt_per_1m: 15.00, completion_per_1m: 75.00}
+  claude-sonnet-4:         {prompt_per_1m: 3.00, completion_per_1m: 15.00}
+  claude-haiku-4:          {prompt_per_1m: 0.80, completion_per_1m: 4.00}
+  claude-3-7-sonnet:       {prompt_per_1m: 3.00, completion_per_1m: 15.00}
+  claude-3-5-haiku:        {prompt_per_1m: 0.80, completion_per_1m: 4.00}
+  claude-3-opus:           {prompt_per_1m: 15.00, completion_per_1m: 75.00}
+
+  # --- Groq (OpenAI-compatible endpoint) ----------------------------------
+  llama-3.3-70b:           {prompt_per_1m: 0.59, completion_per_1m: 0.79}
+  llama-3.1-8b:            {prompt_per_1m: 0.05, completion_per_1m: 0.08}
+  llama-3.1-70b:           {prompt_per_1m: 0.59, completion_per_1m: 0.79}
+  mixtral-8x7b:            {prompt_per_1m: 0.24, completion_per_1m: 0.24}
+
+  # --- Together / OpenRouter ----------------------------------------------
+  meta-llama/Llama-3.3-70B: {prompt_per_1m: 0.88, completion_per_1m: 0.88}
+  meta-llama/llama-3.3-70b: {prompt_per_1m: 0.88, completion_per_1m: 0.88}

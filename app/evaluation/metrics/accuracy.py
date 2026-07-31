@@ -6,9 +6,15 @@ from app.evaluation.models import EvaluationTaskInput, EvaluationExecutionInput,
 @MetricRegistry.register("accuracy")
 class AccuracyMetric(BaseMetricPlugin):
     """
-    Computes exact match accuracy and semantic similarity overlap.
+    Lexical overlap between the response and a reference answer.
+
+    This is a proxy, not a correctness judgement, and it is sensitive to
+    phrasing: a right answer worded differently from the reference scores near
+    zero. It therefore flatters an agent whose phrasing the reference answers
+    were written alongside, and understates any other. Read it next to the
+    assertion and tool metrics, which check contracts rather than wording.
     """
-    
+
     def evaluate(
         self,
         task: EvaluationTaskInput,
@@ -18,7 +24,31 @@ class AccuracyMetric(BaseMetricPlugin):
         # 1. Exact Match Check
         target = (task.expected_answer or "").strip().lower()
         actual = (execution.response or "").strip().lower()
-        
+
+        # No reference answer means there is nothing to compare against, which is
+        # not the same as a wrong answer -- and scoring it anyway inverts the
+        # result. `target in actual` is trivially true for an empty target, so a
+        # task with no expected answer scored 0.4 for arbitrary output and a full
+        # 1.0 when the agent returned nothing at all.
+        if not target:
+            return MetricResult(
+                metric_name="accuracy",
+                score=0.0,
+                measured=False,
+                details={"reason": "task declares no expected_answer"},
+            )
+
+        # An agent that produced nothing has not answered. `actual in target` is
+        # trivially true for an empty string, so a task that errored scored a
+        # full exact match and 0.4 overall -- which is how a run whose every task
+        # failed still reported a global average of 0.549.
+        if not actual:
+            return MetricResult(
+                metric_name="accuracy",
+                score=0.0,
+                details={"exact_match": False, "reason": "agent returned no response"},
+            )
+
         exact_match = 1.0 if target in actual or actual in target else 0.0
         
         # 2. Semantic Similarity Overlap

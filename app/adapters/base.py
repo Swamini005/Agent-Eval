@@ -75,6 +75,22 @@ class BaseAgentAdapter(ABC):
         """
         return []
 
+    # Overridden by adapters that know their own tool surface.
+    KNOWN_TOOLS = frozenset()
+
+    def capabilities(self):
+        """
+        What this agent can do, used to skip tasks it cannot attempt.
+
+        The base implementation claims a planner and retrieval, so an adapter
+        that has not declared its capabilities runs the whole suite. Skipping
+        tasks by accident would quietly shrink the evidence base, which is far
+        worse than running more than necessary.
+        """
+        from app.benchmarks.selection import AgentCapabilities
+
+        return AgentCapabilities(tools=self.KNOWN_TOOLS, plans=True, retrieves=True)
+
     def get_retrieval_documents(self) -> List[Dict[str, Any]]:
         """
         Get the documents this run actually retrieved, as {source, content}.

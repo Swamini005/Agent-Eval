@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Generator, Optional
 
 from app.adapters.base import BaseAgentAdapter
 from app.adapters.registry import AdapterRegistry
+from app.agent_variants import AgentVariant
 from app.packs import PackRegistry
 
 
@@ -40,6 +41,10 @@ class ReActAgentAdapter(BaseAgentAdapter):
     }
 
     def __init__(self):
+        # Behaviour that ablation varies. Defaults to the unimproved agent, so an
+        # adapter built without a variant is the baseline rather than something
+        # ambiguous.
+        self.variant = AgentVariant(name="baseline")
         self.config: Dict[str, Any] = {}
         self.session_id: Optional[str] = None
         self.trace: List[Dict[str, Any]] = []
@@ -47,7 +52,28 @@ class ReActAgentAdapter(BaseAgentAdapter):
         self.metrics: Dict[str, Any] = {}
         self.response = ""
 
+    def capabilities(self):
+        """
+        Tools reachable through the trigger table, plus any the variant adds.
+        No planner -- which is precisely why planner faults measure zero here.
+        """
+        from app.benchmarks.selection import AgentCapabilities
+
+        return AgentCapabilities(
+            tools=set(self.TOOL_TRIGGERS) | set(self.variant.extra_tool_triggers),
+            plans=False,
+            retrieves=True,
+        )
+
+    def configure(self, variant: AgentVariant) -> "ReActAgentAdapter":
+        """Apply an ablation variant. Returns self so factories can chain."""
+        self.variant = variant
+        return self
+
     def initialize(self, config: Dict[str, Any]) -> None:
+        # Deliberately does not touch self.variant: the runner re-initialises the
+        # adapter once per attempt, and resetting the variant here would silently
+        # run the baseline for every task after the first.
         self.config = dict(config)
         self.session_id = config.get("session_id", f"react_{uuid.uuid4().hex[:8]}")
         self.trace = []
@@ -58,6 +84,7 @@ class ReActAgentAdapter(BaseAgentAdapter):
     def run(self, task: str, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         from app.agent.tools import tools_map
 
+        pack = PackRegistry.get(self.DOMAIN)
         start = time.time()
         self.trace.append({"type": "HumanMessage", "content": task})
 
@@ -67,15 +94,10 @@ class ReActAgentAdapter(BaseAgentAdapter):
             if tool is None:
                 continue
             args = self._arguments_for(tool_name, task)
-            try:
-                result = tool.invoke(args)
-            except Exception as e:
-                # Recorded rather than raised: a tool failure is an observation
-                # the suite should score, not a crash of the harness.
-                result = f"Tool error: {e}"
+            result = self._invoke(tool, args)
 
             self.tool_calls.append({"tool_name": tool_name, "args": args, "result": result})
-            observations.append(f"{tool_name}: {result}")
+            observations.append(self._observe(tool_name, result, pack))
             self.trace.append({"type": "ToolMessage", "content": str(result)})
 
         self.response = (
@@ -127,12 +149,45 @@ class ReActAgentAdapter(BaseAgentAdapter):
         self.metrics = {}
         self.response = ""
 
+    def _invoke(self, tool, args: Dict[str, Any]) -> Any:
+        """Call a tool, optionally retrying once on failure."""
+        attempts = 2 if self.variant.retry_on_tool_error else 1
+        last_error = None
+        for _ in range(attempts):
+            try:
+                return tool.invoke(args)
+            except Exception as e:
+                last_error = e
+        # Recorded rather than raised: a tool failure is an observation the suite
+        # should score, not a crash of the harness.
+        return f"Tool error: {last_error}"
+
+    def _observe(self, tool_name: str, result: Any, pack) -> str:
+        """
+        Turn a tool result into an observation for the response.
+
+        With policy_guard on, retrieved documents are acknowledged rather than
+        quoted. Pasting a policy back verbatim states figures the agent cannot
+        vouch for -- exactly what a corrupted-context task forbids.
+        """
+        retrieval_tools = pack.retrieval_tools if pack else frozenset()
+        if self.variant.policy_guard and tool_name in retrieval_tools:
+            return (
+                f"{tool_name}: retrieved a policy document, but I cannot confirm "
+                f"specific figures from it. Please check the official policy for exact terms."
+            )
+        return f"{tool_name}: {result}"
+
     def _select_tools(self, prompt: str) -> List[str]:
         lowered = prompt.lower()
-        return [
+        selected = [
             tool for tool, triggers in self.TOOL_TRIGGERS.items()
             if any(trigger in lowered for trigger in triggers)
+            or any(t in lowered for t in self.variant.extra_tool_triggers.get(tool, []))
         ]
+        if self.variant.max_tool_calls is not None:
+            selected = selected[: self.variant.max_tool_calls]
+        return selected
 
     def _arguments_for(self, tool_name: str, prompt: str) -> Dict[str, Any]:
         """

@@ -72,7 +72,7 @@ class RegressionExperiment:
         seeds: List[int],
         concurrency: int = 4,
         target_label: str = "unknown",
-        suite_sha: str = "",
+        suite_sha: str = None,
         cache_dir: Optional[str] = None,
         replay: bool = False,
     ):
@@ -93,7 +93,15 @@ class RegressionExperiment:
         self.seeds = seeds
         self.concurrency = concurrency
         self.target_label = target_label
-        self.suite_sha = suite_sha
+        # Required whenever caching is on: the hash covers prompts and
+        # assertions, so without it an edited assertion would still hit a stale
+        # cached verdict.
+        if cache_dir and not suite_sha:
+            raise ValueError(
+                "suite_sha is required when cache_dir is set, otherwise cached "
+                "verdicts survive edits to prompts and assertions."
+            )
+        self.suite_sha = suite_sha or ""
         self.cache_dir = cache_dir
         self.replay = replay
         self.cache_hits = 0
@@ -105,13 +113,23 @@ class RegressionExperiment:
         """
         Identity of one (arm, seed) execution.
 
-        Covers everything that can change a verdict: which agent, which tasks,
-        which faults with which parameters, and which seed. Fault configs are
-        serialised in full rather than by id, so editing a delay or a probability
-        invalidates the entry instead of silently reusing it.
+        Covers everything that can change a verdict: which agent, which model
+        behind it, which tasks, which faults with which parameters, and which
+        seed. Fault configs are serialised in full rather than by id, so editing
+        a delay or a probability invalidates the entry instead of reusing it.
+
+        The model identity is essential and was missing. Without it, results
+        cached from a mock run are served verbatim for a run against a real
+        provider -- the cache reports fabricated numbers as measured ones
+        instead of failing, which is the worst way for a harness to be wrong.
         """
+        from app.config import settings
+
         payload = json.dumps({
             "target": self.target_label,
+            "provider": settings.LLM_PROVIDER,
+            "model": settings.MODEL_NAME or "",
+            "temperature": settings.TEMPERATURE,
             "suite_sha": self.suite_sha,
             "task_ids": sorted(t.id for t in self.tasks),
             "arm": arm.label,
@@ -138,8 +156,12 @@ class RegressionExperiment:
             return
         os.makedirs(self.cache_dir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
+            from app.config import settings
+
             json.dump({
                 "target": self.target_label,
+                "provider": settings.LLM_PROVIDER,
+                "model": settings.MODEL_NAME or "",
                 "suite_sha": self.suite_sha,
                 "arm": arm.label,
                 "seed": seed,
@@ -170,7 +192,7 @@ class RegressionExperiment:
         reports = EvaluationEngine().evaluate_run(
             tasks=[
                 EvaluationTaskInput(
-                    task_id=t.id, benchmark=t.benchmark, category=t.category,
+                    task_id=t.id, benchmark=t.benchmark, category=t.category, difficulty=t.difficulty,
                     domain=t.domain, prompt=t.prompt, expected_answer=t.expected_answer,
                     expected_tools=t.expected_tools, ground_truth=t.ground_truth,
                 ) for t in self.tasks
@@ -179,7 +201,7 @@ class RegressionExperiment:
                 EvaluationExecutionInput(
                     task_id=e["task_id"], category=e.get("category", "general"),
                     response=e["response"], latency_seconds=e["latency_seconds"],
-                    cost_usd=e["cost_usd"], tool_calls=e["tool_calls"], tokens=e["tokens"],
+                    cost_usd=e["cost_usd"], tool_calls=e["tool_calls"], tokens=e["tokens"], token_source=e.get("token_source", "estimated"),
                     memory_state=e["memory_state"], retrieval_documents=e["retrieval_documents"],
                     reasoning_nodes=e["reasoning_nodes"], errors=e["errors"],
                 ) for e in execution["tasks"]
@@ -301,12 +323,27 @@ class RegressionExperiment:
             detections.append({"effect": effect, "detection_rate": detection_rate})
 
         fired = [a for a in arms if a["gate_would_fail"]]
+
+        # A regression that did not degrade this target cannot be detected, and
+        # counting it as a miss understates the suite. Reported separately from
+        # the raw planted count so both readings are visible: how many defects
+        # were planted, and how many of those that actually caused harm were
+        # caught. The second is the number that describes the suite.
+        degrading = [a for a in arms if a["true_effect"] > noise]
+        degrading_caught = [a for a in degrading if a["gate_would_fail"]]
+        inert = [a["arm"] for a in arms if a not in degrading]
+
         report = {
             "baseline": baseline,
             "noise_floor": noise,
             "arms": arms,
             "regressions_planted": len(arms),
             "regressions_detected": len(fired),
+            "regressions_that_degraded": len(degrading),
+            "degrading_detection_rate": (
+                round(len(degrading_caught) / len(degrading), 4) if degrading else None
+            ),
+            "inert_regressions": inert,
             "suite_detection_rate": round(len(fired) / len(arms), 4) if arms else None,
             "minimum_detectable_effect": stats.minimum_detectable_effect(
                 [{"effect": a["true_effect"], "detection_rate": 1.0 if a["gate_would_fail"] else 0.0}

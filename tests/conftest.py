@@ -8,11 +8,19 @@ time, and setting these inside a fixture would be too late.
 
 import os
 
-# Force the agent's deterministic rule-based path. Without this the default
-# provider is "google" (app/config.py) and every node attempts a network call
-# that will fail anyway, making runs slow and their latency measurements
-# meaningless. Tests previously required this to be exported by hand.
-os.environ.setdefault("LLM_PROVIDER", "mock")
+# Force the agent's deterministic rule-based path, so the suite needs no key, no
+# network, and returns the same numbers every run.
+#
+# Assigned, not setdefault(). The deepeval pytest plugin loads any .env into
+# os.environ before conftest runs, so setdefault() found LLM_PROVIDER already
+# present and did nothing: adding a .env with a real provider silently turned the
+# unit tests into live model calls. They went from 0.6s to 32s, spent tokens on
+# every run, and failed outright when the key was absent or expired -- failures
+# that point at the code and are nothing of the kind.
+#
+# Set EVAL_ALLOW_LIVE_TESTS=1 to opt a run into whatever .env configures.
+if os.environ.get("EVAL_ALLOW_LIVE_TESTS") != "1":
+    os.environ["LLM_PROVIDER"] = "mock"
 
 # DeepEval reports usage to a third party by default. An evaluation harness
 # should not transmit anything about the runs it is measuring.

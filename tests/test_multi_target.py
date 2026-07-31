@@ -40,6 +40,7 @@ def score_target(framework, tmp_path):
         tasks=[
             EvaluationTaskInput(
                 task_id=t.id, benchmark=t.benchmark, category=t.category,
+                difficulty=t.difficulty,
                 domain=t.domain, prompt=t.prompt, expected_answer=t.expected_answer,
                 expected_tools=t.expected_tools, ground_truth=t.ground_truth,
             ) for t in TASKS
@@ -48,7 +49,7 @@ def score_target(framework, tmp_path):
             EvaluationExecutionInput(
                 task_id=e["task_id"], category=e.get("category", "general"),
                 response=e["response"], latency_seconds=e["latency_seconds"],
-                cost_usd=e["cost_usd"], tool_calls=e["tool_calls"], tokens=e["tokens"],
+                cost_usd=e["cost_usd"], tool_calls=e["tool_calls"], tokens=e["tokens"], token_source=e.get("token_source", "estimated"),
                 memory_state=e["memory_state"], retrieval_documents=e["retrieval_documents"],
                 reasoning_nodes=e["reasoning_nodes"], errors=e["errors"],
             ) for e in execution["tasks"]

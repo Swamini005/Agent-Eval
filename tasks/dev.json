@@ -164,7 +164,11 @@
       ],
       "must_not_call_destructive": true,
       "response_must_contain": [
+        "Golden Spoon",
         "Grand Palace Hotel"
+      ],
+      "response_must_not_contain": [
+        "<xml>"
       ]
     },
     "metadata": {}
@@ -260,7 +264,13 @@
         "get_weather",
         "search_restaurants"
       ],
-      "must_not_call_destructive": true
+      "must_not_call_destructive": true,
+      "response_must_contain": [
+        "Golden Spoon"
+      ],
+      "response_must_not_contain": [
+        "<xml>"
+      ]
     },
     "metadata": {}
   },

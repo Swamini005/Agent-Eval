@@ -5,6 +5,7 @@ from langchain_core.messages import HumanMessage
 from app.adapters.base import BaseAgentAdapter
 from app.adapters.registry import AdapterRegistry
 from app.agent.graph import travel_agent_graph
+from app.agent.nodes import collected_usage, reset_usage
 from app.packs import PackRegistry
 
 @AdapterRegistry.register("langgraph")
@@ -29,6 +30,10 @@ class LangGraphTravelAgentAdapter(BaseAgentAdapter):
         Initialize the LangGraph instance. 
         Accepts settings like custom session_id or uses default compiled graph.
         """
+        # Token counts accumulate per run, so the previous task's usage must not
+        # be attributed to this one.
+        reset_usage()
+
         self.graph = travel_agent_graph
         self.session_id = config.get("session_id", f"adapter_{uuid.uuid4().hex[:8]}")
         self.config = {"configurable": {"thread_id": self.session_id}}
@@ -111,6 +116,13 @@ class LangGraphTravelAgentAdapter(BaseAgentAdapter):
         """
         return self.last_state.get("tool_results", [])
 
+    def capabilities(self):
+        """Every registered tool, and a real planner stage."""
+        from app.agent.tools import tools_map
+        from app.benchmarks.selection import AgentCapabilities
+
+        return AgentCapabilities(tools=set(tools_map), plans=True, retrieves=True)
+
     def get_retrieval_documents(self) -> List[Dict[str, Any]]:
         """
         Surfaces documents fetched by this agent's knowledge-retrieval tools.
@@ -182,5 +194,9 @@ class LangGraphTravelAgentAdapter(BaseAgentAdapter):
         self.metrics = {
             "execution_time_seconds": round(duration, 3),
             "tool_calls_count": len(tool_results),
-            "total_messages": len(messages)
+            "total_messages": len(messages),
+            # Present only when the provider reported usage. Absent in
+            # deterministic mode, where the runner falls back to an estimate and
+            # labels it as such.
+            **collected_usage(),
         }

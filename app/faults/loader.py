@@ -1,7 +1,10 @@
+import logging
 import os
 import yaml
 from typing import List, Dict, Any
 from app.faults.models import FaultConfig
+
+logger = logging.getLogger(__name__)
 
 class FaultConfigLoader:
     """
@@ -49,6 +52,6 @@ class FaultConfigLoader:
             elif isinstance(data, dict) and "faults" in data:
                 return FaultConfigLoader.load_from_dict(data["faults"])
         except Exception as e:
-            print(f"Failed to parse FAULTS_CONFIG environment variable: {e}")
+            logger.warning("FAULTS_CONFIG could not be parsed: %s", e)
             
         return []

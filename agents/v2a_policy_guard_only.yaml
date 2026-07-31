@@ -1,0 +1,13 @@
+name: v2a_policy_guard_only
+description: >
+  policy_guard WITHOUT v1's broadened triggers. Isolates the two changes so the
+  gain can be attributed to one of them rather than to the pair.
+
+  v2 combines both and fixes four tasks; v1 alone fixes none. Without this arm it
+  is impossible to say whether the trigger change contributes anything or is
+  carried entirely by the guard.
+
+extra_tool_triggers: {}
+policy_guard: true
+retry_on_tool_error: false
+max_tool_calls: null

@@ -10,6 +10,7 @@ from app.services.mocks import (
     mock_restaurant_search
 )
 from app.agent.state import AgentState
+from app.agent.llm import DeterministicMode
 from app.agent.nodes import (
     intent_detection_node,
     planner_node,
@@ -55,8 +56,8 @@ def test_mock_services():
 # Test Graph Nodes using Mocked LLM or Fallbacks
 @patch("app.agent.nodes.get_llm")
 def test_intent_detection_fallback(mock_get_llm):
-    # Setup mock LLM failure to trigger fallback
-    mock_get_llm.side_effect = Exception("API Key not found")
+    # Deterministic mode selects the rule-based path
+    mock_get_llm.side_effect = DeterministicMode("LLM_PROVIDER=mock")
     
     state: AgentState = {
         "messages": [HumanMessage(content="Search a flight to Paris and find a nice hotel")],
@@ -76,7 +77,7 @@ def test_intent_detection_fallback(mock_get_llm):
 
 @patch("app.agent.nodes.get_llm")
 def test_planner_node_fallback(mock_get_llm):
-    mock_get_llm.side_effect = Exception("API Key not found")
+    mock_get_llm.side_effect = DeterministicMode("LLM_PROVIDER=mock")
     
     state: AgentState = {
         "messages": [HumanMessage(content="Check weather in London")],

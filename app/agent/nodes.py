@@ -1,33 +1,53 @@
+import logging
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.globals import set_llm_cache
-from langchain_core.caches import InMemoryCache
-from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from app.config import settings
+from app.agent.llm import DeterministicMode, get_llm, text_of, token_usage
 from app.agent.state import AgentState
 from app.agent.tools import travel_tools, tools_map
 
-# Enable global in-memory caching for LLMs
-set_llm_cache(InMemoryCache())
+logger = logging.getLogger(__name__)
+
+# Deliberately NO global LLM cache here.
+#
+# `set_llm_cache(InMemoryCache())` used to run at import. It is process-global, so
+# importing this module silently changed behaviour for every chat model in the
+# process -- including third-party agents under test and the triage advisor.
+#
+# In an evaluation harness that destroys the measurement. Seeds exist to sample a
+# stochastic agent; for the clean arm the prompts are identical across seeds, so
+# every seed after the first returned the first one's cached response. Five seeds
+# became one sample and four copies, stdev was 0 by construction, and the Wilson
+# intervals and Fisher tests were computed over pseudo-replicates.
+#
+# Caching belongs at the run level, where RegressionExperiment does it: keyed on
+# seed, arm, provider and suite, so repeats are skipped without collapsing variance.
+
+# Real token counts as reported by the provider, accumulated across the LLM calls
+# a single task makes. The runner previously estimated tokens as len(text)//4 and
+# priced that estimate as if it were measured; with a real model the provider
+# reports exact figures, so the cost it derives is the real cost.
+_USAGE: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
 
 
-def get_llm() -> BaseChatModel:
-    """Helper to initialize the LLM based on configuration."""
-    provider = settings.LLM_PROVIDER.lower()
-    
-    if provider == "google":
-        model_name = settings.MODEL_NAME or "gemini-1.5-flash"
-        # API key is automatically picked up from GEMINI_API_KEY / GOOGLE_API_KEY
-        return ChatGoogleGenerativeAI(model=model_name, temperature=0)
-    elif provider == "openai":
-        model_name = settings.MODEL_NAME or "gpt-4o-mini"
-        return ChatOpenAI(model=model_name, temperature=0, api_key=settings.OPENAI_API_KEY)
-    else:
-        # Fallback/Mock LLM if none configured or invalid
-        raise ValueError(f"Unsupported LLM provider: {provider}")
+def reset_usage() -> None:
+    """Clear the accumulator. Called by the adapter before each run."""
+    _USAGE.update({"prompt_tokens": 0, "completion_tokens": 0})
+
+
+def collected_usage() -> Dict[str, int]:
+    """Usage reported so far, or {} when the provider reported none."""
+    if not any(_USAGE.values()):
+        return {}
+    return dict(_USAGE)
+
+
+def _track(response):
+    """Accumulate provider-reported usage; returns the response unchanged."""
+    for key, value in token_usage(response).items():
+        _USAGE[key] = _USAGE.get(key, 0) + value
+    return response
+
 
 def intent_detection_node(state: AgentState) -> Dict[str, Any]:
     """
@@ -56,19 +76,19 @@ def intent_detection_node(state: AgentState) -> Dict[str, Any]:
     
     try:
         llm = get_llm()
-        response = llm.invoke([SystemMessage(content="You are an intent detection module."), HumanMessage(content=prompt)])
+        response = _track(llm.invoke([SystemMessage(content="You are an intent detection module."), HumanMessage(content=prompt)]))
         
         # Clean response content and parse JSON
-        content = response.content.strip()
+        content = text_of(response).strip()
         if content.startswith("```json"):
             content = content.replace("```json", "").replace("```", "").strip()
         elif content.startswith("```"):
             content = content.replace("```", "").strip()
             
         intent_data = json.loads(content)
-    except Exception as e:
-        # Fallback parsing in case of API failure or parser issue
-        print(f"Error in intent detection: {e}. Using rule-based fallback.")
+    except DeterministicMode:
+        # Deliberate: no model configured, so use the rule-based path. A real
+        # model error is not caught here and fails the task instead.
         query_lower = last_message.lower()
         intent_data = {
             "flights": "flight" in query_lower or "fly" in query_lower or "ticket" in query_lower,
@@ -103,15 +123,15 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     
     try:
         llm = get_llm()
-        response = llm.invoke([SystemMessage(content="You are a travel planner module."), HumanMessage(content=prompt)])
-        content = response.content.strip()
+        response = _track(llm.invoke([SystemMessage(content="You are a travel planner module."), HumanMessage(content=prompt)]))
+        content = text_of(response).strip()
         if content.startswith("```json"):
             content = content.replace("```json", "").replace("```", "").strip()
         elif content.startswith("```"):
             content = content.replace("```", "").strip()
         plan = json.loads(content)
-    except Exception as e:
-        print(f"Error in planner node: {e}. Generating default plan.")
+    except DeterministicMode:
+        # Deliberate rule-based path; real model errors propagate.
         plan = []
         if intent.get("flights"):
             plan.append("Search flights matching the query")
@@ -157,10 +177,10 @@ def tool_selection_node(state: AgentState) -> Dict[str, Any]:
     try:
         llm = get_llm()
         llm_with_tools = llm.bind_tools(travel_tools)
-        response = llm_with_tools.invoke([
+        response = _track(llm_with_tools.invoke([
             SystemMessage(content="You are a tool selector module. Choose the single best tool and arguments for the current step."),
             HumanMessage(content=prompt)
-        ])
+        ]))
         
         tool_calls = []
         if hasattr(response, "tool_calls") and response.tool_calls:
@@ -171,8 +191,8 @@ def tool_selection_node(state: AgentState) -> Dict[str, Any]:
                     "id": tc["id"]
                 })
         return {"tool_calls": tool_calls}
-    except Exception as e:
-        print(f"Error in tool selection: {e}. Choosing no tool/fallback.")
+    except DeterministicMode:
+        # Deliberate rule-based path; real model errors propagate.
         return {"tool_calls": []}
 
 def execute_tool_node(state: AgentState) -> Dict[str, Any]:
@@ -188,7 +208,7 @@ def execute_tool_node(state: AgentState) -> Dict[str, Any]:
         tool_args = tc["args"]
         tool_id = tc["id"]
         
-        print(f"Executing tool: {tool_name} with args {tool_args}")
+        logger.debug("Tool call: %s(%s)", tool_name, tool_args)
         
         if tool_name in tools_map:
             try:
@@ -230,7 +250,9 @@ def reasoning_node(state: AgentState) -> Dict[str, Any]:
     next_step_idx = current_step_idx + 1
     
     reasoning_summary = f"Completed step {next_step_idx} of {len(plan)}: {plan[current_step_idx] if current_step_idx < len(plan) else 'N/A'}"
-    print(reasoning_summary)
+    # One line per plan step per task. It belongs in the trace, which it already
+    # is via the return value, not on stdout.
+    logger.debug("%s", reasoning_summary)
     
     return {
         "current_step": next_step_idx,
@@ -257,14 +279,13 @@ def response_generation_node(state: AgentState) -> Dict[str, Any]:
     
     try:
         llm = get_llm()
-        response = llm.invoke([
+        response = _track(llm.invoke([
             SystemMessage(content="You are a professional travel assistant. Synthesize all details into a structured, highly useful response."),
             HumanMessage(content=prompt)
-        ])
-        final_text = response.content
-    except Exception as e:
-        # Fallback text generator
-        print(f"Error in response generation: {e}")
+        ]))
+        final_text = text_of(response)
+    except DeterministicMode:
+        # Deliberate rule-based path; real model errors propagate.
         final_text = "Here is the summary of your travel details:\n\n"
         for tr in tool_results:
             final_text += f"### {tr['tool_name'].replace('_', ' ').title()}\n{tr['result']}\n\n"

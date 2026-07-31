@@ -14,5 +14,16 @@ pandas>=2.2.0
 reportlab>=4.1.0
 pyyaml>=6.0
 pytest>=8.0.0
+# Lets the dashboard show the real branch and commit instead of "unknown".
+# Arrives transitively via deepeval, declared here because we depend on it.
+GitPython>=3.1
 deepeval>=4.0
 agentevals>=0.0.9
+
+# Pinned below langsmith's floor deliberately. Windows Application Control on
+# some managed machines blocks the newer native wheels by file hash, and
+# langchain_core hard-imports uuid_utils with no fallback -- so a blocked wheel
+# makes the entire project unimportable, not just the tests. 0.10.0 provides the
+# uuid7 API that langsmith actually calls. Remove the pin once the policy allows
+# the current build.
+uuid_utils==0.10.0

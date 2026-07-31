@@ -122,3 +122,46 @@ def test_foreign_benchmark_exports_load_through_a_provider(tmp_path, monkeypatch
 
 def test_registry_lists_its_providers():
     assert set(BenchmarkRegistry.available()) >= {"harbor", "contextbench", "t3bench", "custom_json"}
+
+
+def test_compiled_artifacts_do_not_escalate_the_triage_floor():
+    """A stale .pyc beside a source file is not a change to that file.
+
+    app/adapters/__pycache__/base.cpython-312.pyc read as a change to the adapter
+    contract, which escalates to "affects every task" -- so a run that should
+    have selected a handful of tasks selected all thirty and triage did nothing.
+    """
+    from app.benchmarks.impact import is_artifact, select_affected
+    from app.benchmarks.suites import load_suite
+
+    assert is_artifact("app/adapters/__pycache__/base.cpython-312.pyc")
+    assert is_artifact("reports/results.json")
+    assert not is_artifact("app/adapters/base.py")
+
+    tasks = load_suite("dev").tasks
+    _, rationale = select_affected(tasks, paths=["app/adapters/__pycache__/base.cpython-312.pyc"])
+    assert rationale["scope"] != "all", rationale["reason"]
+
+
+def test_triage_selected_regressions_are_the_ones_injected():
+    """The selection used to be recorded and then ignored.
+
+    demo_pipeline injected a hardcoded set of four faults regardless of what
+    triage chose, so a decision naming a regression was decoration -- the run
+    exercised something else entirely and the report said otherwise.
+    """
+    from demo_pipeline import DEFAULT_FAULT_CONFIG, faults_for_regressions
+    from app.faults.loader import FaultConfigLoader
+
+    specs = faults_for_regressions(["planner_bypass_confirmation", "random_tool_failure"])
+    assert [f["type"] for f in specs] == ["planner_bypass_confirmation", "random_tool_failure"]
+    assert len(FaultConfigLoader.load_from_dict(specs)) == 2
+
+    # An unknown label contributes nothing rather than raising: triage validates
+    # against this same catalogue, so a mismatch means the catalogue changed
+    # under a cached decision.
+    assert faults_for_regressions(["no-such-regression"]) == []
+
+    # No triage falls back to the default set, which the gate is calibrated on.
+    assert faults_for_regressions([]) == []
+    assert len(DEFAULT_FAULT_CONFIG["faults"]) == 4

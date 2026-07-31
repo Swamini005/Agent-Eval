@@ -21,6 +21,7 @@ import yaml
 
 import app.adapters  # noqa: F401  (import registers the concrete adapters)
 from app.adapters.factory import AgentFactory
+from app.logging_setup import configure, verbosity_from_args
 from app.benchmarks.suites import load_suite
 from app.config import REPORTS_DIR
 from app.evaluation.experiment import Arm, RegressionExperiment
@@ -45,6 +46,7 @@ def load_catalogue(path: str = "regressions.yaml"):
 
 
 def main():
+    configure(verbosity_from_args(sys.argv))
     suite_name, seed_count, target = DEFAULT_SUITE, DEFAULT_SEEDS, DEFAULT_TARGET
     replay = "--replay" in sys.argv
     no_cache = "--no-cache" in sys.argv
@@ -100,7 +102,15 @@ def main():
     print("-" * 69)
     print()
     print(f"Cache                     : {experiment.cache_hits} hits, {experiment.cache_misses} executed")
-    print(f"Regressions detected      : {report['regressions_detected']}/{report['regressions_planted']}")
+    degrading = report["regressions_that_degraded"]
+    rate = report["degrading_detection_rate"]
+    print(f"Regressions planted       : {report['regressions_planted']}")
+    print(f"  of which degraded       : {degrading}"
+          f"  (inert against this target: {report['inert_regressions']})")
+    if rate is not None:
+        print(f"  detected                : {len(
+            [a for a in report['arms'] if a['gate_would_fail']])}/{degrading}"
+              f"  = {rate * 100:.0f}% of regressions that actually caused harm")
 
     mde = report["minimum_detectable_effect"]
     if mde is None:

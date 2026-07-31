@@ -19,6 +19,7 @@ import tempfile
 import app.adapters  # noqa: F401  (registers the concrete adapters)
 from app.adapters.factory import AgentFactory
 from app.benchmarks.models import UnifiedBenchmarkTask
+from app.logging_setup import configure, verbosity_from_args
 from app.benchmarks.runner import BenchmarkRunner
 from app.evaluation.engine import EvaluationEngine
 from app.evaluation.models import EvaluationTaskInput, EvaluationExecutionInput
@@ -27,10 +28,14 @@ DEFAULT_TARGET = "react"
 
 # Applied to any field the caller omits, so a reviewer can hand over the three
 # fields that matter -- prompt, domain, ground_truth -- without boilerplate.
+#
+# `domain` is deliberately absent: defaulting it would score a task from an
+# unknown domain using another domain's vocabulary. An undeclared domain has no
+# pack, so domain-dependent checks report themselves unmeasured instead.
 DEFAULTS = {
     "benchmark": "adhoc",
     "category": "general",
-    "domain": "travel",
+    "domain": "",
     "difficulty": "medium",
     "expected_answer": None,
     "expected_tools": [],
@@ -56,13 +61,18 @@ def load_tasks(path: str):
 
 
 def main():
+    configure(verbosity_from_args(sys.argv))
     args = [a for a in sys.argv[1:]]
     paths = [a for a in args if not a.startswith("--")]
     target = next((a.split("=", 1)[1] for a in args if a.startswith("--target=")), DEFAULT_TARGET)
     as_json = "--json" in args
 
-    if not paths:
+    if len(paths) != 1:
+        # Silently ignoring extra paths would run a subset of what was asked for
+        # and report a verdict for the whole set.
         print(__doc__)
+        if len(paths) > 1:
+            print(f"ERROR: expected one task file, got {len(paths)}: {paths}")
         return 2
 
     tasks = load_tasks(paths[0])
@@ -80,7 +90,7 @@ def main():
         reports = EvaluationEngine().evaluate_run(
             tasks=[
                 EvaluationTaskInput(
-                    task_id=t.id, benchmark=t.benchmark, category=t.category,
+                    task_id=t.id, benchmark=t.benchmark, category=t.category, difficulty=t.difficulty,
                     domain=t.domain, prompt=t.prompt, expected_answer=t.expected_answer,
                     expected_tools=t.expected_tools, ground_truth=t.ground_truth,
                 ) for t in tasks
@@ -116,6 +126,11 @@ def main():
         print(f"  response : {(record.get('response') or '')[:160]}")
         print(f"  tools    : {[c.get('tool_name') for c in record.get('tool_calls', [])]}")
         print(f"  latency  : {record.get('latency_seconds')}s")
+
+        # Surfaced before the assertions: when a task errored, the assertions
+        # are downstream noise and the error is the finding.
+        for error in record.get("errors", []):
+            print(f"    ERROR {error[:220]}")
 
         for check in assertions.get("checks", []):
             mark = "ok  " if check["passed"] else "FAIL"

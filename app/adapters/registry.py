@@ -1,4 +1,4 @@
-from typing import Dict, Type
+from typing import Dict, List, Type
 from app.adapters.base import BaseAgentAdapter
 
 class AdapterRegistry:
@@ -24,3 +24,8 @@ class AdapterRegistry:
                 f"Adapter '{name}' is not registered. Available adapters: {list(cls._registry.keys())}"
             )
         return cls._registry[name_lower]
+
+    @classmethod
+    def available(cls) -> List[str]:
+        """Names of every registered adapter, for discovery and error messages."""
+        return sorted(cls._registry)

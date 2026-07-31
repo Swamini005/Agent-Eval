@@ -1,3 +1,4 @@
+import logging
 import json
 import os
 import random
@@ -6,6 +7,8 @@ import zlib
 from typing import List, Dict, Optional
 from datetime import datetime, timezone
 from app.faults.models import FaultConfig, FaultLogEntry
+
+logger = logging.getLogger(__name__)
 
 class FaultInjectionEngine:
     """
@@ -97,7 +100,10 @@ class FaultInjectionEngine:
             task_id=self.current_task_id
         )
         self.logs.append(entry)
-        print(f"FAULT INJECTED [{config.severity.upper()}]: {config.type} on {config.component}. Expected: {expected_impact}")
+        # Per-injection and therefore very high volume: one line per fault per
+        # task. Debug so a normal run stays readable and -v still shows it.
+        logger.debug("Fault injected [%s]: %s on %s -- %s",
+                     config.severity.upper(), config.type, config.component, expected_impact)
 
     def increment_steps(self) -> None:
         self.step_counter += 1
@@ -157,4 +163,4 @@ class FaultInjectionEngine:
         with open(report_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
-        print(f"Fault logs saved to {log_file} and {report_file}")
+        logger.info("Fault logs written to %s and %s", log_file, report_file)

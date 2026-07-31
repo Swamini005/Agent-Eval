@@ -26,25 +26,71 @@ class ModelRate(BaseModel):
 
 class Pricing(BaseModel):
     default_model: str
-    models: Dict[str, ModelRate]
+    models: Dict[str, ModelRate] = Field(default_factory=dict)
+    families: Dict[str, ModelRate] = Field(default_factory=dict)
+
+    def rate_for(self, model: str) -> Optional[ModelRate]:
+        """
+        Rate for a model: exact name first, then the longest matching prefix.
+
+        The prefix layer stops a new point release from silently costing zero.
+        `gemini-3.5-flash-lite-preview-0409` has no exact entry but matches the
+        `gemini-3.5-flash-lite` family. Longest match wins, so
+        `gemini-2.5-flash-lite` is never priced as `gemini-2.5-flash`.
+        """
+        if model in self.models:
+            return self.models[model]
+
+        matches = [name for name in self.families if model.startswith(name)]
+        if not matches:
+            return None
+        return self.families[max(matches, key=len)]
 
     def cost(self, prompt_tokens: int, completion_tokens: int,
              model: Optional[str] = None) -> float:
         """
-        Cost of one call, in USD.
+        Cost of one call, in USD, at the rates for the model actually in use.
 
         An unknown model is priced at zero rather than guessed. Inventing a rate
-        would produce a confident number with no basis, which is worse than a
-        visible zero.
+        produces a confident number with no basis, which is worse than a visible
+        zero -- and pricing a Groq run at Gemini rates, as this did before the
+        model was resolved from configuration, is exactly that failure.
         """
-        rate = self.models.get(model or self.default_model)
+        rate = self.rate_for(model or active_model())
         if rate is None:
+            # Zero, but the caller must be able to tell this apart from a model
+            # that genuinely costs nothing. See has_rate(): reporting an unpriced
+            # model as $0.00 reads as "free" and is the same class of error as
+            # reporting an unmeasured metric as a pass.
             return 0.0
         return round(
             (prompt_tokens / 1_000_000) * rate.prompt_per_1m
             + (completion_tokens / 1_000_000) * rate.completion_per_1m,
             8,
         )
+
+
+def has_rate(model: Optional[str] = None) -> bool:
+    """Whether a rate exists for this model, exactly or by family prefix."""
+    return load_pricing().rate_for(model or active_model()) is not None
+
+
+def active_model() -> str:
+    """
+    The model this run is using, resolved the same way the agent resolves it.
+
+    Falls back to the price list's default only in deterministic mode, where no
+    model is involved and the figure is a shadow cost.
+    """
+    from app.agent.llm import DEFAULT_MODELS
+    from app.config import settings
+
+    if settings.MODEL_NAME:
+        return settings.MODEL_NAME
+    provider = settings.LLM_PROVIDER.lower()
+    if provider in DEFAULT_MODELS:
+        return DEFAULT_MODELS[provider]
+    return load_pricing().default_model
 
 
 _cache: Optional[Pricing] = None

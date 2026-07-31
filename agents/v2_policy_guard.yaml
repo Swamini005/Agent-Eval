@@ -1,0 +1,20 @@
+name: v2_policy_guard
+description: >
+  Adds v1, plus stops echoing retrieved policy documents verbatim.
+
+  dev-context-01, -02 and -04 failed because the agent pasted the whole document
+  into its answer, including the exact figures ($50, 24 hours) that a task with a
+  corrupted or unverified context forbids it from stating. It reports that it
+  retrieved a policy and that specifics cannot be confirmed, instead of quoting
+  numbers it cannot vouch for.
+
+extra_tool_triggers:
+  get_policy_document:
+    - "change my ticket"
+    - "free of charge"
+    - "before departure"
+    - "baggage"
+    - "administrative"
+policy_guard: true
+retry_on_tool_error: false
+max_tool_calls: null
